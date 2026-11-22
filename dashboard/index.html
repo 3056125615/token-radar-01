@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Token Launch Radar</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="top">
+  <div class="wrap head">
+    <div class="brand">
+      <span class="mark" aria-hidden="true"><span></span></span>
+      <div>
+        <h1>Token Launch Radar</h1>
+        <p class="tagline">Ranks protocols that record no token yet by what a launch could be worth — each with a farm plan.</p>
+      </div>
+    </div>
+  </div>
+  <div class="wrap"><p class="snap" id="snap-line">Snapshot: DefiLlama protocols</p></div>
+</header>
+
+<main class="wrap">
+  <section id="list-view">
+    <section class="panel method" aria-labelledby="method-title">
+      <div class="method-copy">
+        <h2 class="sec" id="method-title">Method</h2>
+        <p class="formula">implied value = TVL × category multiple × growth adjustment × age adjustment</p>
+        <p class="sub">Rounded to the nearest dollar, with a $1 floor. Every input comes from the sealed snapshot.</p>
+        <dl class="defs">
+          <div>
+            <dt>Category multiple</dt>
+            <dd>Median market-cap ÷ TVL among protocols in the same category that already trade. Fewer than <span data-samples>3</span> samples → global median. Clamped to 0.05–20.</dd>
+          </div>
+          <div>
+            <dt>Growth adjustment</dt>
+            <dd>1 + clamp(7d change, −30, +30) ÷ 100 × 0.5. A +30% week adds 15%, a −30% week subtracts 15%; a missing change counts as 0.</dd>
+          </div>
+          <div>
+            <dt>Age adjustment</dt>
+            <dd>1 + 0.2 × min(1, log10(1 + days ÷ 30) ÷ log10(13)). Longer tokenless operation scores higher, capped at +20% and reached at 360 days.</dd>
+          </div>
+          <div>
+            <dt>Scope</dt>
+            <dd>CEXs, liquid staking and restaking, bridges and canonical bridges, wrapped or staked products, exchange-branded names, and versioned pools of a live-token protocol are removed: wrappers or staking forms of an existing token, not pre-token protocols.</dd>
+          </div>
+        </dl>
+        <p class="note">Every row <b>records no token in this snapshot</b>: neither a CoinGecko id nor a ticker. That is a snapshot fact, not a claim about a project's history or plans.</p>
+      </div>
+      <aside class="method-side" aria-labelledby="mult-title">
+        <h3 class="side-title" id="mult-title">Category multiples</h3>
+        <p class="side-note">Own medians where a category has at least <span data-samples>3</span> trading samples; other categories use the global median. Clamped to 0.05–20.</p>
+        <table class="mini">
+          <thead><tr><th scope="col">Category</th><th scope="col" class="num">Multiple</th><th scope="col">Category</th><th scope="col" class="num">Multiple</th></tr></thead>
+          <tbody id="mult-body"></tbody>
+        </table>
+        <p class="side-note">Computed over every trading protocol in the snapshot, before the scope filter.</p>
+        <p class="disc">Implied value is a model estimate, not a prediction that a token will be issued.</p>
+      </aside>
+    </section>
+
+    <div class="controls">
+      <input id="q" type="search" placeholder="Search name or slug" aria-label="Search by name or slug" autocomplete="off">
+      <select id="cat" aria-label="Filter by category"></select>
+      <select id="chain" aria-label="Filter by chain"></select>
+      <label class="check"><input type="checkbox" id="watch"> Watchlist only</label>
+      <select id="min" aria-label="Minimum TVL">
+        <option value="0">Any TVL</option>
+        <option value="10000000">$10M+ TVL</option>
+        <option value="50000000">$50M+ TVL</option>
+        <option value="100000000">$100M+ TVL</option>
+        <option value="500000000">$500M+ TVL</option>
+      </select>
+    </div>
+    <div class="meta">
+      <span id="count"></span>
+      <span class="hint">Click any row for the farm plan and a live recomputation</span>
+    </div>
+
+    <table class="board">
+      <caption class="sr-only">Protocols that record no token in this snapshot, ranked by implied launch value.</caption>
+      <thead>
+        <tr>
+          <th class="num" data-sort="rank" tabindex="0" scope="col" aria-sort="ascending">Rank</th>
+          <th data-sort="name" tabindex="0" scope="col">Protocol</th>
+          <th scope="col">Category</th>
+          <th scope="col">Chains</th>
+          <th class="num" data-sort="tvl" tabindex="0" scope="col">TVL</th>
+          <th class="num" data-sort="chg" tabindex="0" scope="col">7d %</th>
+          <th class="num" data-sort="age" tabindex="0" scope="col">Tokenless for</th>
+          <th class="num" data-sort="multiple" tabindex="0" scope="col">Multiple</th>
+          <th class="num" data-sort="implied" tabindex="0" scope="col">Implied value</th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </section>
+
+  <section id="detail-view" hidden></section>
+</main>
+
+<footer>
+  <div class="wrap foot"><p id="foot"></p></div>
+</footer>
+
+<script src="../data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
