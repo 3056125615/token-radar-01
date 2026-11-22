@@ -11,10 +11,15 @@
   var rows = R.rows;
   var model = R.model;
   var stats = R.stats;
+  var funnel = R.funnel;
+  var excluded = Array.isArray(R.excluded) ? R.excluded : [];
   var TOTAL = stats.selected;
   var state = { q: '', cat: '', chain: '', watch: false, min: 0, sort: 'rank', dir: 1 };
   var bySlug = Object.create(null);
   rows.forEach(function (row) { bySlug[row.slug] = row; });
+  var maxImplied = rows.reduce(function (max, row) {
+    return row.implied_value_usd > max ? row.implied_value_usd : max;
+  }, 0) || 1;
 
   var listView = document.getElementById('list-view');
   var detailView = document.getElementById('detail-view');
@@ -38,6 +43,11 @@
     if (value >= 1e6) return '$' + (value / 1e6).toFixed(1) + 'M';
     if (value >= 1e3) return '$' + Math.round(value / 1e3) + 'K';
     return '$' + Math.round(value);
+  }
+
+  function fmtFloor(value) {
+    if (value >= 1e6 && value % 1e6 === 0) return '$' + (value / 1e6) + 'M';
+    return fmtUsd(value);
   }
 
   function fmtAge(days) {
@@ -68,40 +78,148 @@
 
   function fmtMultiple(value) { return '×' + value.toFixed(2); }
 
+  var REASON_ORDER = ['CATEGORY_DERIVATIVE', 'PRODUCT_FORM', 'TOKEN_LINEAGE', 'EXCHANGE_BRAND'];
+  var REASON_INFO = {
+    CATEGORY_DERIVATIVE: {
+      short: 'category derivative',
+      tiny: 'category derivatives',
+      rule: 'The category field marks a derivative venue (CEX, liquid staking/restaking, bridges).'
+    },
+    PRODUCT_FORM: {
+      short: 'product form',
+      tiny: 'product-form',
+      rule: 'The name field itself declares a wrapped or staked product form.'
+    },
+    TOKEN_LINEAGE: {
+      short: 'token lineage',
+      tiny: 'lineage',
+      rule: 'The name stem is identical to a token-bearing protocol in the same snapshot.'
+    },
+    EXCHANGE_BRAND: {
+      short: 'exchange brand',
+      tiny: 'exchange-brand',
+      rule: 'The name opens with an exchange brand — an external common-knowledge rule, the only screen not derived from the snapshot.'
+    }
+  };
+
+  function renderFunnel() {
+    if (!funnel) {
+      $('funnel').hidden = true;
+      $('funnel-reasons').hidden = true;
+      return;
+    }
+    var stages = [
+      { value: funnel.snapshot, label: 'in snapshot', end: false },
+      { value: funnel.tokenless, label: 'record no token', end: false },
+      { value: funnel.excluded, label: 'set aside', end: false },
+      { value: funnel.ranked, label: 'ranked', end: true }
+    ];
+    var total = funnel.snapshot > 0 ? funnel.snapshot : 1;
+    var html = '';
+    stages.forEach(function (stage, index) {
+      if (index) html += '<div class="farrow" aria-hidden="true">→</div>';
+      html += '<div class="fstage' + (stage.end ? ' end' : '') + '">' +
+        '<b>' + fmtNum(stage.value) + '</b><span>' + stage.label + '</span>' +
+        '<i class="fm" style="width:' + (stage.value / total * 100).toFixed(1) + '%"></i></div>';
+    });
+    $('funnel').innerHTML = html;
+    $('funnel').setAttribute('aria-label', 'Funnel: ' + fmtNum(funnel.snapshot) + ' in snapshot, ' +
+      fmtNum(funnel.tokenless) + ' record no token, ' + fmtNum(funnel.excluded) + ' set aside, ' +
+      fmtNum(funnel.ranked) + ' ranked');
+    var parts = REASON_ORDER.map(function (code) {
+      return '<b>' + fmtNum((funnel.by_reason && funnel.by_reason[code]) || 0) + '</b> ' + REASON_INFO[code].tiny;
+    });
+    $('funnel-reasons').innerHTML = 'Set aside by first-hit reason: ' + parts.join(' · ');
+  }
+
+  function renderCoverage() {
+    if (!funnel) {
+      $('cover').hidden = true;
+      return;
+    }
+    var html = '';
+    REASON_ORDER.forEach(function (code) {
+      var count = (funnel.by_reason && funnel.by_reason[code]) || 0;
+      html += '<tr><td><code>' + code + '</code>' +
+        (code === 'EXCHANGE_BRAND' ? '<span class="ext">external</span>' : '') +
+        '</td><td class="num">' + fmtNum(count) + '</td><td>' + REASON_INFO[code].rule + '</td></tr>';
+    });
+    $('cov-body').innerHTML = html;
+    $('ledger-btn').textContent = 'Show the ' + fmtNum(excluded.length) + '-row ledger';
+  }
+
+  var ledgerBuilt = false;
+  function buildLedger() {
+    var body = excluded.map(function (row) {
+      var info = REASON_INFO[row.reason_code];
+      var short = info ? info.short : row.reason_code;
+      return '<tr><td class="lname">' + esc(row.name) + '</td>' +
+        '<td>' + esc(row.category || '—') + '</td>' +
+        '<td class="num">' + fmtUsd(row.tvl_usd) + '</td>' +
+        '<td class="lreason" title="' + esc(row.reason_label || short) + '">' + esc(short) + '</td></tr>';
+    }).join('');
+    $('ledger').innerHTML = '<table class="ledger-table">' +
+      '<caption class="sr-only">Protocols set aside, in TVL order, with the first screen that caught each.</caption>' +
+      '<thead><tr><th scope="col">Name</th><th scope="col">Category</th>' +
+      '<th scope="col" class="num">TVL</th><th scope="col">Reason</th></tr></thead>' +
+      '<tbody>' + body + '</tbody></table>';
+    ledgerBuilt = true;
+  }
+
+  $('ledger-btn').addEventListener('click', function () {
+    var open = this.getAttribute('aria-expanded') === 'true';
+    if (!open && !ledgerBuilt) buildLedger();
+    this.setAttribute('aria-expanded', String(!open));
+    $('ledger').hidden = open;
+    this.textContent = (open ? 'Show' : 'Hide') + ' the ' + fmtNum(excluded.length) + '-row ledger';
+  });
+
   snapLine.innerHTML =
     'Snapshot: DefiLlama protocols, as of ' + esc(R.as_of) +
-    ' · <b>' + stats.protocols + '</b> scanned' +
-    ' · <b>' + stats.no_token + '</b> record no token' +
-    ' · <b>' + stats.selected + '</b> ranked' +
     ' · <b>' + stats.watchlist + '</b> on the house watchlist';
   $('foot').textContent = 'Data: DefiLlama snapshot as of ' + R.as_of + ' · Model ' + R.model_version +
     ' · Implied values are model estimates, not predictions that a token will be issued.';
   document.querySelectorAll('[data-samples]').forEach(function (el) {
     el.textContent = model.min_category_samples;
   });
+  if (typeof R.floor_usd === 'number') $('floor-usd').textContent = fmtFloor(R.floor_usd);
 
   // Category multiple table: the global fallback plus every category whose own median replaced it.
   var global = model.global_multiple;
-  var ownCategories = Object.keys(model.multiples)
-    .filter(function (key) { return Math.abs(model.multiples[key] - global) > 1e-12; })
-    .sort(function (a, b) { return model.multiples[b] - model.multiples[a]; });
+  var detail = Array.isArray(model.multiples_detail) ? model.multiples_detail : null;
+  var entries = [{ label: 'Global median (fallback)', value: global, n: model.global_samples, g: true }];
+  if (detail) {
+    detail.filter(function (item) { return item.basis === 'category-median'; })
+      .sort(function (a, b) { return b.multiple - a.multiple; })
+      .forEach(function (item) {
+        entries.push({ label: item.category, value: item.multiple, n: item.n, g: false });
+      });
+  } else {
+    Object.keys(model.multiples)
+      .filter(function (key) { return Math.abs(model.multiples[key] - global) > 1e-12; })
+      .sort(function (a, b) { return model.multiples[b] - model.multiples[a]; })
+      .forEach(function (key) {
+        entries.push({ label: key, value: model.multiples[key], n: null, g: false });
+      });
+  }
+  function nLabel(n) {
+    return n === null || n === undefined ? '' : '<span class="n">n=' + n + '</span>';
+  }
   var multHtml = '';
-  var entries = [{ label: 'Global median (fallback)', value: global, g: true }];
-  ownCategories.forEach(function (key) {
-    entries.push({ label: key, value: model.multiples[key], g: false });
-  });
   for (var i = 0; i < entries.length; i += 2) {
     var a = entries[i];
     var b = entries[i + 1];
-    multHtml += '<tr><td' + (a.g ? ' class="g"' : '') + '>' + esc(a.label) +
+    multHtml += '<tr><td' + (a.g ? ' class="g"' : '') + '>' + esc(a.label) + nLabel(a.n) +
       '</td><td class="num' + (a.g ? ' g' : '') + '">×' + a.value.toFixed(3) + '</td>';
     multHtml += b
-      ? '<td' + (b.g ? ' class="g"' : '') + '>' + esc(b.label) +
+      ? '<td' + (b.g ? ' class="g"' : '') + '>' + esc(b.label) + nLabel(b.n) +
         '</td><td class="num' + (b.g ? ' g' : '') + '">×' + b.value.toFixed(3) + '</td>'
       : '<td></td><td class="num"></td>';
     multHtml += '</tr>';
   }
   $('mult-body').innerHTML = multHtml;
+  renderFunnel();
+  renderCoverage();
 
   // Filter options come from the rows themselves.
   var categories = [];
@@ -180,6 +298,7 @@
   function render() {
     var list = sortRows(visibleRows());
     var html = list.map(function (row) {
+      var barWidth = Math.max(0, Math.min(100, row.implied_value_usd / maxImplied * 100));
       return '<tr data-slug="' + esc(row.slug) + '" tabindex="0">' +
         '<td class="num rank' + (row.rank <= 3 ? ' top' : '') + '">' + row.rank + '</td>' +
         '<td class="proto" title="' + esc(row.name) + '">' + esc(row.name) +
@@ -190,7 +309,8 @@
         '<td class="num ' + chgClass(row.change_7d) + '">' + fmtChg(row.change_7d) + '</td>' +
         '<td class="num age">' + fmtAge(row.age_days) + '</td>' +
         '<td class="num mult">' + fmtMultiple(row.multiple) + '</td>' +
-        '<td class="num implied">' + fmtUsd(row.implied_value_usd) + '</td>' +
+        '<td class="num implied">' + fmtUsd(row.implied_value_usd) +
+          '<span class="ibar" aria-hidden="true"><span style="width:' + barWidth.toFixed(2) + '%"></span></span></td>' +
         '</tr>';
     }).join('');
     tbody.innerHTML = html || '<tr class="empty"><td colspan="9">No protocols match these filters.</td></tr>';

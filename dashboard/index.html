@@ -18,6 +18,10 @@
     </div>
   </div>
   <div class="wrap"><p class="snap" id="snap-line">Snapshot: DefiLlama protocols</p></div>
+  <div class="wrap">
+    <div class="funnel" id="funnel" role="group" aria-label="Snapshot to board funnel"></div>
+    <p class="freasons" id="funnel-reasons"></p>
+  </div>
 </header>
 
 <main class="wrap">
@@ -27,6 +31,7 @@
         <h2 class="sec" id="method-title">Method</h2>
         <p class="formula">implied value = TVL × category multiple × growth adjustment × age adjustment</p>
         <p class="sub">Rounded to the nearest dollar, with a $1 floor. Every input comes from the sealed snapshot.</p>
+        <p class="coverage"><b>Coverage, not a model input.</b> The sealed snapshot is one fixed file, the same bytes every entrant works from. Its <span id="floor-usd">$50M</span> figure is the snapshot's own coverage floor, not a model parameter; this board ranks every protocol in the snapshot that records no token and passes the four screens below.</p>
         <dl class="defs">
           <div>
             <dt>Category multiple</dt>
@@ -40,16 +45,16 @@
             <dt>Age adjustment</dt>
             <dd>1 + 0.2 × min(1, log10(1 + days ÷ 30) ÷ log10(13)). Longer tokenless operation scores higher, capped at +20% and reached at 360 days.</dd>
           </div>
-          <div>
-            <dt>Scope</dt>
-            <dd>CEXs, liquid staking and restaking, bridges and canonical bridges, wrapped or staked products, exchange-branded names, and versioned pools of a live-token protocol are removed: wrappers or staking forms of an existing token, not pre-token protocols.</dd>
+          <div class="wide">
+            <dt>Eligibility screens</dt>
+            <dd>Four screens run in order and the first match sets a protocol aside. <b>CATEGORY_DERIVATIVE</b> reads the category field for a derivative venue (CEX, liquid staking/restaking, bridges). <b>PRODUCT_FORM</b> reads the name for a wrapped or staked product form. <b>TOKEN_LINEAGE</b> matches a version-stripped name to a protocol that records a token in this snapshot. <b>EXCHANGE_BRAND</b> matches an exchange-brand prefix — external common knowledge, the only screen not derived from the snapshot.</dd>
           </div>
         </dl>
         <p class="note">Every row <b>records no token in this snapshot</b>: neither a CoinGecko id nor a ticker. That is a snapshot fact, not a claim about a project's history or plans.</p>
       </div>
       <aside class="method-side" aria-labelledby="mult-title">
         <h3 class="side-title" id="mult-title">Category multiples</h3>
-        <p class="side-note">Own medians where a category has at least <span data-samples>3</span> trading samples; other categories use the global median. Clamped to 0.05–20.</p>
+        <p class="side-note">Own medians where a category has at least <span data-samples>3</span> trading samples; other categories use the global median. n is the number of market-cap-to-TVL samples behind the row. Clamped to 0.05–20.</p>
         <table class="mini">
           <thead><tr><th scope="col">Category</th><th scope="col" class="num">Multiple</th><th scope="col">Category</th><th scope="col" class="num">Multiple</th></tr></thead>
           <tbody id="mult-body"></tbody>
@@ -57,6 +62,19 @@
         <p class="side-note">Computed over every trading protocol in the snapshot, before the scope filter.</p>
         <p class="disc">Implied value is a model estimate, not a prediction that a token will be issued.</p>
       </aside>
+    </section>
+
+    <section class="panel cover" id="cover" aria-labelledby="cover-title">
+      <h2 class="sec" id="cover-title">Coverage &amp; exclusions</h2>
+      <p class="cover-lede">Each tokenless protocol meets the four screens in order; the first match sets it aside and everything left is ranked. Counts come from the snapshot's own funnel.</p>
+      <table class="cov">
+        <caption class="sr-only">Exclusion reason codes with counts and the rule each applies.</caption>
+        <thead><tr><th scope="col">Reason code</th><th scope="col" class="num">Count</th><th scope="col">Rule</th></tr></thead>
+        <tbody id="cov-body"></tbody>
+      </table>
+      <p class="firsthit">Each protocol gets the first screen that matches it; in this snapshot the lineage and brand screens catch no row the earlier screens miss, and stay as guards.</p>
+      <button class="ledger-btn" id="ledger-btn" type="button" aria-expanded="false" aria-controls="ledger">Show the ledger</button>
+      <div id="ledger" hidden></div>
     </section>
 
     <div class="controls">

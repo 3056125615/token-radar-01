@@ -2,9 +2,11 @@
 //
 // Every number on the board is derived from the sealed snapshot. The category multiple comes from
 // the market-cap-to-TVL ratios of the protocols that already trade; the radar set comes from the
-// no-token protocols that pass the product filter, plus every slug the watchlist names; and the
-// implied value combines TVL, the category multiple, seven-day growth and age. No protocol name is
-// special-cased anywhere below.
+// no-token protocols that pass the four exclusion rules, plus every slug the watchlist names; and
+// the implied value combines TVL, the category multiple, seven-day growth and age. No protocol is
+// special-cased in the scoring: the same formula runs on every row. The exclusion gate is stated
+// separately, and only its exchange-brand list rests on external common knowledge instead of a
+// snapshot field.
 
 /** One protocol as the sealed snapshot carries it: the ten fields, no others. */
 export interface SnapshotProtocol {
@@ -46,10 +48,65 @@ export interface RadarRow {
   watchlist: boolean;
 }
 
+/** The four reasons a protocol can be left off the ranked board, in gate order. */
+export type ExclusionReasonCode =
+  | 'CATEGORY_DERIVATIVE'
+  | 'PRODUCT_FORM'
+  | 'TOKEN_LINEAGE'
+  | 'EXCHANGE_BRAND';
+
+/**
+ * Where a rule's test comes from. Three rules read fields the snapshot carries and can be
+ * recomputed from it; the exchange-brand rule leans on external common knowledge.
+ */
+export type RuleBasis = 'snapshot-recomputable' | 'external-common-knowledge';
+
+/** One exclusion rule as the data export states it: code, order, label, basis and fields. */
+export interface ExclusionRule {
+  code: ExclusionReasonCode;
+  order: number;
+  label: string;
+  basis: RuleBasis;
+  snapshot_fields: string[];
+  note: string;
+}
+
+/** One protocol the gate left off, with the first rule that fired. */
+export interface ExcludedRow {
+  slug: string;
+  name: string;
+  category: string | null;
+  tvl_usd: number;
+  reason_code: ExclusionReasonCode;
+  reason_label: string;
+}
+
+/** The snapshot-to-board accounting: every protocol is ranked, excluded or token-bearing. */
+export interface Funnel {
+  snapshot: number;
+  tokenless: number;
+  excluded: number;
+  ranked: number;
+  watchlist: number;
+  by_reason: Record<ExclusionReasonCode, number>;
+}
+
+/** One category's multiple and the sample count behind it. */
+export interface MultipleDetail {
+  category: string;
+  multiple: number;
+  n: number;
+  basis: 'category-median' | 'global-fallback';
+}
+
 /** The model's constants and the category multiple table, so the page can state what it runs. */
 export interface ModelParameters {
+  /** The numeric map the dashboard recomputes from; kept as-is for that page. */
   multiples: Record<string, number>;
+  /** The same table in export form, one entry per category with its sample count. */
+  multiples_detail: MultipleDetail[];
   global_multiple: number;
+  global_samples: number;
   min_category_samples: number;
   multiple_min: number;
   multiple_max: number;
@@ -75,6 +132,9 @@ export interface RadarData {
   floor_usd: number;
   model_version: string;
   model: ModelParameters;
+  exclusion_rules: ExclusionRule[];
+  excluded: ExcludedRow[];
+  funnel: Funnel;
   rows: RadarRow[];
   stats: RadarStats;
 }
@@ -89,12 +149,55 @@ const MIN_GROUP_SAMPLES = 3;
 const GROWTH_CLAMP_PCT = 30;
 const GROWTH_WEIGHT = 0.5;
 const AGE_WEIGHT = 0.2;
+/** A seven-day move below this absolute percentage is not called out as momentum. */
+const MOMENTUM_THRESHOLD_PCT = 10;
 /** At 360 days, 1 + age/30 = 13 and the age term reaches its full weight. */
 const AGE_FULL_DAYS = 360;
 const AGE_LOG_TARGET = Math.log10(1 + AGE_FULL_DAYS / 30);
 
+/**
+ * The four exclusion rules, in evaluation order. The first three are recomputable from the
+ * snapshot's own fields. The fourth rests on external common knowledge: the exchange-brand list
+ * is not a snapshot field, and both this comment and the exported rule state that basis so the
+ * board never passes an outside assumption off as a snapshot derivation.
+ */
+const EXCLUSION_RULES: ExclusionRule[] = [
+  {
+    code: 'CATEGORY_DERIVATIVE',
+    order: 1,
+    label: 'Category is CEX, liquid staking, liquid restaking, restaked BTC, bridge or canonical bridge',
+    basis: 'snapshot-recomputable',
+    snapshot_fields: ['category'],
+    note: 'Reads the category field and matches it against a fixed set of derivative categories.',
+  },
+  {
+    code: 'PRODUCT_FORM',
+    order: 2,
+    label: 'Name carries the product form wrapped, staked or staking',
+    basis: 'snapshot-recomputable',
+    snapshot_fields: ['name'],
+    note: 'Reads the name field for a whole word wrapped, staked or staking.',
+  },
+  {
+    code: 'TOKEN_LINEAGE',
+    order: 3,
+    label: 'Name is a versioned line of a protocol that already records a token',
+    basis: 'snapshot-recomputable',
+    snapshot_fields: ['name', 'gecko_id', 'symbol'],
+    note: 'Strips a trailing version marker from the name and matches the stem against the names of protocols that record a token in this snapshot.',
+  },
+  {
+    code: 'EXCHANGE_BRAND',
+    order: 4,
+    label: 'Name starts with an exchange brand (external common-knowledge rule)',
+    basis: 'external-common-knowledge',
+    snapshot_fields: ['name'],
+    note: 'The exchange-brand prefix list is external common knowledge, not a snapshot field; only the prefix match against the name is recomputable from the snapshot.',
+  },
+];
+
 /** Categories that are a product of another protocol, not a pre-token protocol of their own. */
-const EXCLUDED_CATEGORIES = new Set([
+const DERIVATIVE_CATEGORIES = new Set([
   'CEX',
   'Liquid Staking',
   'Liquid Restaking',
@@ -104,13 +207,18 @@ const EXCLUDED_CATEGORIES = new Set([
 ]);
 
 /** A wrapped, staked or staking product is not a protocol still waiting on its own token. */
-const WRAPPED_WORD = /\b(wrapped|staked|staking)\b/i;
+const PRODUCT_FORM_WORD = /\b(wrapped|staked|staking)\b/i;
 
-/** An exchange's own product is not a pre-token protocol either. */
-const EXCHANGE_PREFIX = /^(Binance|Coinbase|Bybit|Kraken|Bitget|OKX|Bitfinex|Gemini)/i;
+/** An exchange's own product is not a pre-token protocol either; this list is external knowledge. */
+const EXCHANGE_BRAND_PREFIX = /^(Binance|Coinbase|Bybit|Kraken|Bitget|OKX|Bitfinex|Gemini)/i;
 
 /** DefiLlama's version marker: a space, then V2, v2, 2.0 or the like, at the end of the name. */
 const VERSION_SUFFIX = /\s(V\d+(?:\.\d+)?|v\d+(?:\.\d+)?|\d+\.\d+)$/;
+
+/** The label the data export attaches to a reason code. */
+function ruleLabel(code: ExclusionReasonCode): string {
+  return EXCLUSION_RULES.find((rule) => rule.code === code)?.label ?? code;
+}
 
 /** Chains whose gas is L2-cheap rather than mainnet-expensive. */
 const L2_CHAINS = new Set([
@@ -212,13 +320,18 @@ function median(values: number[]): number {
 
 interface MultipleTable {
   by_category: Record<string, number>;
+  detail: MultipleDetail[];
   global: number;
+  global_samples: number;
 }
 
 /**
  * The category multiple table. For every protocol with a token and a positive TVL, ratio is
  * market cap / TVL; a category's median ratio is its multiple. Categories with fewer than three
  * samples take the global median, and every multiple is clamped to [0.05, 20].
+ *
+ * The detail keeps the sample count behind each multiple: n is the number of positive
+ * mcap-to-TVL ratios in that category, and a fallback entry still reports its own n.
  */
 function buildMultipleTable(protocols: SnapshotProtocol[]): MultipleTable {
   const ratios = new Map<string, number[]>();
@@ -234,13 +347,27 @@ function buildMultipleTable(protocols: SnapshotProtocol[]): MultipleTable {
   }
   const global = all.length > 0 ? clamp(median(all), MULTIPLE_MIN, MULTIPLE_MAX) : 1;
   const byCategory = new Map<string, number>();
+  const detail: MultipleDetail[] = [];
   for (const p of protocols) {
     const key = categoryKey(p.category);
     if (byCategory.has(key)) continue;
     const sample = ratios.get(key) ?? [];
-    byCategory.set(key, sample.length >= MIN_GROUP_SAMPLES ? clamp(median(sample), MULTIPLE_MIN, MULTIPLE_MAX) : global);
+    const ownMedian = sample.length >= MIN_GROUP_SAMPLES;
+    const multiple = ownMedian ? clamp(median(sample), MULTIPLE_MIN, MULTIPLE_MAX) : global;
+    byCategory.set(key, multiple);
+    detail.push({
+      category: key,
+      multiple,
+      n: sample.length,
+      basis: ownMedian ? 'category-median' : 'global-fallback',
+    });
   }
-  return { by_category: Object.fromEntries(byCategory), global };
+  detail.sort((a, b) => {
+    if (a.category < b.category) return -1;
+    if (a.category > b.category) return 1;
+    return 0;
+  });
+  return { by_category: Object.fromEntries(byCategory), detail, global, global_samples: all.length };
 }
 
 function multipleFor(category: string | null, table: MultipleTable): number {
@@ -285,21 +412,31 @@ function versionedFromLiveProtocol(p: SnapshotProtocol, liveNames: Set<string>):
   return liveNames.has(stem);
 }
 
-/** The product filter: no exchange, staking or bridge product, and no versioned pool of a live token. */
-function passesProductFilter(p: SnapshotProtocol, liveNames: Set<string>): boolean {
-  if (p.category !== null && EXCLUDED_CATEGORIES.has(p.category)) return false;
-  if (WRAPPED_WORD.test(p.name)) return false;
-  if (EXCHANGE_PREFIX.test(p.name)) return false;
-  if (versionedFromLiveProtocol(p, liveNames)) return false;
-  return true;
+/**
+ * The first exclusion rule that fires, in gate order: category, product form, token lineage,
+ * exchange brand. A null answer means the protocol is a candidate for the radar set. Every test
+ * reads the snapshot's own fields; only the exchange-brand list is external common knowledge.
+ */
+function exclusionReason(p: SnapshotProtocol, liveNames: Set<string>): ExclusionReasonCode | null {
+  if (p.category !== null && DERIVATIVE_CATEGORIES.has(p.category)) return 'CATEGORY_DERIVATIVE';
+  if (PRODUCT_FORM_WORD.test(p.name)) return 'PRODUCT_FORM';
+  if (versionedFromLiveProtocol(p, liveNames)) return 'TOKEN_LINEAGE';
+  if (EXCHANGE_BRAND_PREFIX.test(p.name)) return 'EXCHANGE_BRAND';
+  return null;
+}
+
+interface Selection {
+  selected: SnapshotProtocol[];
+  excluded: ExcludedRow[];
 }
 
 /**
- * The radar set: every watchlist slug, plus every no-token protocol that passes the product filter.
- * The forty watchlist slugs all pass the filter in the sealed snapshot; the watchlist loop still
- * force-includes each of them, so no gate-required row can ever be dropped by a filter change.
+ * The radar set: every watchlist slug, plus every no-token protocol that passes the four rules.
+ * The forty watchlist slugs all pass the rules in the sealed snapshot; the watchlist loop still
+ * force-includes each of them, so no gate-required row can ever be dropped by a rule change.
+ * The excluded ledger holds every no-token protocol the rules left out, in TVL order.
  */
-function selectProtocols(snapshot: Snapshot): SnapshotProtocol[] {
+function selectProtocols(snapshot: Snapshot): Selection {
   const index = new Map(snapshot.protocols.map((p) => [p.slug, p]));
   const liveNames = new Set<string>();
   for (const p of snapshot.protocols) {
@@ -310,10 +447,49 @@ function selectProtocols(snapshot: Snapshot): SnapshotProtocol[] {
     const p = index.get(slug);
     if (p !== undefined) chosen.set(slug, p);
   }
+  const excluded: ExcludedRow[] = [];
   for (const p of snapshot.protocols) {
-    if (!chosen.has(p.slug) && tokenless(p) && passesProductFilter(p, liveNames)) chosen.set(p.slug, p);
+    if (chosen.has(p.slug) || !tokenless(p)) continue;
+    const reason = exclusionReason(p, liveNames);
+    if (reason === null) {
+      chosen.set(p.slug, p);
+      continue;
+    }
+    excluded.push({
+      slug: p.slug,
+      name: p.name,
+      category: p.category,
+      tvl_usd: p.tvl_usd,
+      reason_code: reason,
+      reason_label: ruleLabel(reason),
+    });
   }
-  return [...chosen.values()];
+  excluded.sort((a, b) => {
+    if (b.tvl_usd !== a.tvl_usd) return b.tvl_usd - a.tvl_usd;
+    if (a.slug < b.slug) return -1;
+    if (a.slug > b.slug) return 1;
+    return 0;
+  });
+  return { selected: [...chosen.values()], excluded };
+}
+
+/** The snapshot-to-board accounting, with a zero count for every reason code. */
+function buildFunnel(snapshot: Snapshot, ranked: number, excluded: ExcludedRow[]): Funnel {
+  const by_reason: Record<ExclusionReasonCode, number> = {
+    CATEGORY_DERIVATIVE: 0,
+    PRODUCT_FORM: 0,
+    TOKEN_LINEAGE: 0,
+    EXCHANGE_BRAND: 0,
+  };
+  for (const row of excluded) by_reason[row.reason_code] += 1;
+  return {
+    snapshot: snapshot.protocols.length,
+    tokenless: snapshot.protocols.filter(tokenless).length,
+    excluded: excluded.length,
+    ranked,
+    watchlist: snapshot.watchlist.length,
+    by_reason,
+  };
 }
 
 /** One farm step before it is flattened into the gate's one-string form. */
@@ -334,304 +510,389 @@ function primaryChain(p: SnapshotProtocol): string {
   return p.chains.length > 0 ? p.chains[0]! : 'its main chain';
 }
 
-/** How much capital one farm position needs, from the protocol's own TVL. */
-function capitalFor(tvl: number): number {
-  if (tvl >= 5_000_000_000) return 250;
-  if (tvl >= 1_000_000_000) return 150;
-  if (tvl >= 100_000_000) return 100;
-  return 50;
+/** Position size bands: below $75M is a test position, $75-250M mid, above $250M large. */
+type SizeTier = 'small' | 'mid' | 'large';
+
+function sizeFor(tvl: number): { tier: SizeTier; label: string; range: string } {
+  if (tvl < 75_000_000) return { tier: 'small', label: 'small test position', range: '$100-300' };
+  if (tvl <= 250_000_000) return { tier: 'mid', label: 'mid-tier position', range: '$300-1,000' };
+  return { tier: 'large', label: 'large position', range: '$1,000-3,000' };
 }
 
-/** A gas estimate in the chain's own tier: mainnet, L2, Solana or everything else. */
-function gasFor(chain: string): string {
-  const key = chain.toLowerCase();
-  if (key === 'ethereum') return 'Ethereum mainnet gas at about $5-25 per transaction';
-  if (L2_CHAINS.has(key)) return 'L2 gas at about $0.05-0.50 per transaction';
-  if (key === 'solana') return 'Solana fees at about $0.01-0.05 per transaction';
-  return 'moderate gas at about $0.50-2 per transaction';
-}
-
-/** The shared last step: every plan ends with the same risk and exit rule. */
-function riskStep(name: string, category: string | null, gas: string): FarmAction {
-  const label = category === null ? 'an uncategorized protocol' : `a protocol in the ${category} category`;
+/** The protocol's time on the snapshot without a token, as a plain-years clause. */
+function ageFor(ageDays: number | null): { clause: string; short: string } {
+  if (ageDays === null) {
+    return {
+      clause: 'an unrecorded listing age in this snapshot',
+      short: 'not recorded in this snapshot',
+    };
+  }
+  const years = ageDays / 365;
+  const yearsText = years < 0.1 ? 'less than 0.1 years' : `${years.toFixed(1)} years`;
   return {
-    text: `Keep an exit plan for ${name}, ${label}: follow its official announcements, stop farming if a token is announced with no community allocation, and never borrow money to fund a farm position.`,
-    cost: `nothing to hold, and ${gas} for the exit transaction`,
+    clause: `${yearsText} (${ageDays} days) without a token in this snapshot`,
+    short: `${yearsText} without a token`,
+  };
+}
+
+/** The change as a momentum clause only when it is at least 10% in either direction. */
+function momentumFor(change: number | null): string | null {
+  if (change === null || Math.abs(change) < MOMENTUM_THRESHOLD_PCT) return null;
+  const direction = change > 0 ? 'up' : 'down';
+  return `TVL is ${direction} ${Math.abs(change).toFixed(1)}% over seven days`;
+}
+
+/** Gas in the chain's own tier, with a short form for sentences. */
+function gasProfile(chain: string): { cost: string; short: string } {
+  const key = chain.toLowerCase();
+  if (key === 'ethereum') {
+    return { cost: 'Ethereum mainnet gas at about $5-25 per transaction', short: 'Ethereum mainnet gas' };
+  }
+  if (L2_CHAINS.has(key)) {
+    return { cost: 'L2 gas at about $0.05-0.50 per transaction', short: 'L2 gas' };
+  }
+  if (key === 'solana') {
+    return { cost: 'Solana fees at about $0.01-0.05 per transaction', short: 'Solana fees' };
+  }
+  return { cost: 'moderate gas at about $0.50-2 per transaction', short: 'moderate gas' };
+}
+
+/** All the protocol-specific material one plan may use, taken from the snapshot fields alone. */
+interface FarmProfile {
+  name: string;
+  chain: string;
+  category: string;
+  sizeTier: SizeTier;
+  sizeLabel: string;
+  sizeRange: string;
+  sizePhrase: string;
+  ageShort: string;
+  ageSentence: string;
+  momentum: string | null;
+  change7d: number | null;
+  gas: string;
+  gasShort: string;
+}
+
+function profileFor(p: SnapshotProtocol, ageDays: number | null): FarmProfile {
+  const size = sizeFor(p.tvl_usd);
+  const age = ageFor(ageDays);
+  const chain = primaryChain(p);
+  const gas = gasProfile(chain);
+  return {
+    name: p.name,
+    chain,
+    category: p.category ?? 'Uncategorized',
+    sizeTier: size.tier,
+    sizeLabel: size.label,
+    sizeRange: size.range,
+    sizePhrase: `${size.label} (${size.range})`,
+    ageShort: age.short,
+    ageSentence:
+      ageDays === null
+        ? `${p.name}'s listing date is not recorded in this snapshot.`
+        : `${p.name} has been listed for ${age.clause}.`,
+    momentum: momentumFor(p.change_7d),
+    change7d: p.change_7d,
+    gas: gas.cost,
+    gasShort: gas.short,
+  };
+}
+
+/** The shared last step: every plan ends with a risk and exit rule that names the protocol and chain. */
+function riskStep(p: FarmProfile): FarmAction {
+  return {
+    text: `Set the exit rule for ${p.name} on ${p.chain} before adding more: the position is a ${p.sizeLabel} of ${p.sizeRange}, and the listing is ${p.ageShort}. Follow ${p.name}'s official announcements, stop farming if a token is announced with no community allocation, and never borrow money to fund the position.`,
+    cost: `nothing to hold, and ${p.gas} for the exit`,
     time: '15 minutes a week',
   };
 }
 
-/** The category's four actions; categories without a template take the generic four. */
-function categoryActions(category: string | null, name: string, chain: string, capital: number, gas: string): FarmAction[] {
+/** The tier's own add-on advice, so even the momentum step reads differently by TVL band. */
+function tierAdvice(p: FarmProfile): string {
+  if (p.sizeTier === 'small') return 'Keep it a test position and do not average down';
+  if (p.sizeTier === 'mid') return 'Stage any add-on in two clips';
+  return 'Size any add-on in thirds';
+}
+
+/** The seven-day move, stated either as a momentum signal or as the measured absence of one. */
+function momentumNote(p: FarmProfile): string {
+  if (p.momentum !== null) return p.momentum;
+  if (p.change7d === null) return 'its seven-day change is not recorded in this snapshot';
+  const magnitude = Math.abs(p.change7d).toFixed(2);
+  return `the absolute seven-day move is ${magnitude}%, below the ${MOMENTUM_THRESHOLD_PCT}% momentum mark`;
+}
+
+/** The fourth step: momentum, the TVL band, and the protocol's own information channels. */
+function momentumAndIntel(p: FarmProfile): string {
+  return `Momentum and intel check on ${p.name} on ${p.chain}: ${momentumNote(p)}. ${tierAdvice(p)}, keep the total inside the ${p.sizeRange} band, and follow ${p.name}'s official blog, documentation and governance forum for fee changes, incentives and token announcements.`;
+}
+
+/** Three category-common actions; every one names the protocol, its chain and its TVL band. */
+interface CategoryPlay {
+  entry: (p: FarmProfile) => string;
+  core: (p: FarmProfile) => string;
+  upkeep: (p: FarmProfile) => string;
+}
+
+/**
+ * The category's own common actions. A category with no case takes the generic play: read the
+ * documentation, use the core product once, and return for one documented action a week. None
+ * of these texts names a pool, an APY or any fact the snapshot does not carry.
+ */
+function categoryPlay(category: string): CategoryPlay {
   switch (category) {
     case 'Dexs':
-      return [
-        {
-          text: `Swap half of $${capital} of USDC into ${chain}'s native asset on ${name} and keep both tokens in the same fresh wallet.`,
-          cost: `$${capital} of capital plus ${gas}`,
-          time: '20 minutes',
-        },
-        {
-          text: `Deposit the USDC and native-asset pair into ${name}'s deepest liquidity pool and stake the LP receipt if the pool issues one.`,
-          cost: `${gas} for the deposit and the staking transaction`,
-          time: '15 minutes',
-        },
-        {
-          text: `Rebalance the ${name} position once a week with a small swap and claim any pool rewards from the protocol's own page.`,
-          cost: `${gas} per weekly swap and claim`,
-          time: '10 minutes a week',
-        },
-        {
-          text: `Track ${name}'s official blog, documentation and governance forum for fee changes, points programs and launch news.`,
-          cost: 'no on-chain cost',
-          time: '10 minutes a week',
-        },
-      ];
+    case 'Liquidity Manager':
+      return {
+        entry: (p) =>
+          `Open a ${p.sizePhrase} in ${p.name} on ${p.chain}: swap half into the chain's native asset and keep both sides in one fresh wallet. ${p.ageSentence}`,
+        core: (p) =>
+          `Provide the pair to ${p.name}'s official liquidity page on ${p.chain}, stake the LP receipt only if its documentation names a staking contract, and keep the total inside the ${p.sizeRange} band.`,
+        upkeep: (p) =>
+          `Rebalance the ${p.name} position on ${p.chain} once a week with one small swap, claim any published rewards from the protocol's own page, and keep the ${p.sizeRange} band as the ceiling. Its listing age is ${p.ageShort}.`,
+      };
     case 'Lending':
-      return [
-        {
-          text: `Supply $${capital} of USDC to ${name} on ${chain} and keep the receipt token in the same wallet.`,
-          cost: `$${capital} of capital plus ${gas}`,
-          time: '15 minutes',
-        },
-        {
-          text: `Borrow no more than 30% of the supplied value against the position, then repay it within a week to build a clean on-chain history.`,
-          cost: `${gas} for the borrow and the repay`,
-          time: '20 minutes plus one week',
-        },
-        {
-          text: `Check ${name}'s health factor once a week, add collateral if it nears the liquidation line, and claim rewards from the official app.`,
-          cost: `${gas} per adjustment`,
-          time: '10 minutes a week',
-        },
-        {
-          text: `Follow ${name}'s official documentation, blog and governance forum for incentive changes and token announcements.`,
-          cost: 'no on-chain cost',
-          time: '10 minutes a week',
-        },
-      ];
+    case 'Uncollateralized Lending':
+    case 'Leveraged Farming':
+      return {
+        entry: (p) =>
+          `Open a ${p.sizePhrase} in ${p.name} on ${p.chain}: supply a major stablecoin and keep the receipt token in the same wallet. ${p.ageSentence}`,
+        core: (p) =>
+          `Borrow no more than 30% of the supplied value on ${p.name} in ${p.chain}, repay within a week, and keep the total inside the ${p.sizeRange} band.`,
+        upkeep: (p) =>
+          `Check ${p.name}'s health factor on ${p.chain} once a week, add collateral if it nears the liquidation line, and keep enough ${p.gasShort} for adjustments. Its listing age is ${p.ageShort}.`,
+      };
     case 'CDP':
-      return [
-        {
-          text: `Deposit $${capital} of ETH or a liquid staking token as collateral in ${name} on ${chain} and keep the position visible in the app.`,
-          cost: `$${capital} of capital plus ${gas}`,
-          time: '20 minutes',
-        },
-        {
-          text: `Mint the protocol's stablecoin at no more than 30% of the collateral value, then hold or use only part of it.`,
-          cost: `${gas} for the mint transaction`,
-          time: '15 minutes',
-        },
-        {
-          text: `Repay a little of the debt each week and keep the collateral ratio well above ${name}'s liquidation threshold.`,
-          cost: `${gas} per weekly repay`,
-          time: '10 minutes a week',
-        },
-        {
-          text: `Read ${name}'s official documentation and governance forum weekly for parameter changes and token announcements.`,
-          cost: 'no on-chain cost',
-          time: '10 minutes a week',
-        },
-      ];
-    case 'Yield':
-      return [
-        {
-          text: `Deposit $${capital} of USDC into ${name}'s main vault on ${chain} and keep the vault share token.`,
-          cost: `$${capital} of capital plus ${gas}`,
-          time: '15 minutes',
-        },
-        {
-          text: `Route the deposit into the vault's core strategy and stake the receipt if ${name} offers a staking contract.`,
-          cost: `${gas} for the strategy and staking transactions`,
-          time: '20 minutes',
-        },
-        {
-          text: `Claim and compound the yield once a week from ${name}'s own app, and check the vault's fees and caps.`,
-          cost: `${gas} per weekly claim`,
-          time: '10 minutes a week',
-        },
-        {
-          text: `Follow ${name}'s official blog, documentation and governance forum for strategy updates and token news.`,
-          cost: 'no on-chain cost',
-          time: '10 minutes a week',
-        },
-      ];
-    case 'Risk Curators':
-      return [
-        {
-          text: `Allocate $${capital} of USDC to a vault curated by ${name} on ${chain} and keep the vault shares.`,
-          cost: `$${capital} of capital plus ${gas}`,
-          time: '15 minutes',
-        },
-        {
-          text: `Review ${name}'s published allocation and risk notes, then split the capital across two of its vaults.`,
-          cost: `${gas} for the second deposit`,
-          time: '20 minutes',
-        },
-        {
-          text: `Recheck the curated positions once a week and withdraw from any vault whose collateral or counterparty changes.`,
-          cost: `${gas} per withdrawal`,
-          time: '10 minutes a week',
-        },
-        {
-          text: `Follow ${name}'s official dashboard, blog and governance forum for new vaults and token news.`,
-          cost: 'no on-chain cost',
-          time: '10 minutes a week',
-        },
-      ];
-    case 'Onchain Capital Allocator':
-      return [
-        {
-          text: `Deposit $${capital} of USDC into ${name}'s flagship vault on ${chain} and keep the receipt token.`,
-          cost: `$${capital} of capital plus ${gas}`,
-          time: '15 minutes',
-        },
-        {
-          text: `Review how ${name} splits capital across venues, then keep the position through at least one full allocation cycle.`,
-          cost: `${gas} for any rebalance`,
-          time: '30 days',
-        },
-        {
-          text: `Check the vault's reported yield and risk weekly, and rebalance only through ${name}'s official app.`,
-          cost: `${gas} per rebalance`,
-          time: '10 minutes a week',
-        },
-        {
-          text: `Follow ${name}'s official blog, documentation and governance forum for allocation changes and token news.`,
-          cost: 'no on-chain cost',
-          time: '10 minutes a week',
-        },
-      ];
-    case 'RWA':
-      return [
-        {
-          text: `Complete any required onboarding and deposit $${capital} of USDC to mint ${name}'s yield-bearing asset on ${chain}.`,
-          cost: `$${capital} of capital plus ${gas}`,
-          time: '30 minutes',
-        },
-        {
-          text: `Hold the RWA receipt in the same wallet and reinvest the yield through ${name}'s official platform.`,
-          cost: `${gas} per reinvestment`,
-          time: '15 minutes',
-        },
-        {
-          text: `Check the asset's NAV, yield and redemption window once a week and keep records of every mint.`,
-          cost: 'no on-chain cost',
-          time: '10 minutes a week',
-        },
-        {
-          text: `Follow ${name}'s official site, documentation and governance forum for eligibility, redemption and token news.`,
-          cost: 'no on-chain cost',
-          time: '10 minutes a week',
-        },
-      ];
+    case 'CDP Manager':
     case 'Collateral Markets':
-      return [
-        {
-          text: `Supply $${capital} of an accepted collateral asset to ${name} on ${chain} and keep the receipt token.`,
-          cost: `$${capital} of capital plus ${gas}`,
-          time: '20 minutes',
-        },
-        {
-          text: `Use the receipt in ${name}'s collateral market or a listed integration, keeping the position small and transparent.`,
-          cost: `${gas} for the integration transaction`,
-          time: '20 minutes',
-        },
-        {
-          text: `Monitor the collateral ratio and oracle status weekly, and top up or repay before any parameter change.`,
-          cost: `${gas} per adjustment`,
-          time: '10 minutes a week',
-        },
-        {
-          text: `Follow ${name}'s official documentation, blog and governance forum for market listings and token news.`,
-          cost: 'no on-chain cost',
-          time: '10 minutes a week',
-        },
-      ];
+    case 'Anchor BTC':
+    case 'Decentralized BTC':
+      return {
+        entry: (p) =>
+          `Open a ${p.sizePhrase} in ${p.name} on ${p.chain}: deposit the collateral asset its documentation accepts and keep the position visible in the protocol's own app. ${p.ageSentence}`,
+        core: (p) =>
+          `Mint or borrow no more than 30% of the collateral value in ${p.name} on ${p.chain}, then hold only part of the proceeds and keep the ${p.sizeRange} band as the ceiling.`,
+        upkeep: (p) =>
+          `Repay a little of the ${p.name} debt on ${p.chain} each week and keep the collateral ratio well above the protocol's published liquidation threshold. Its listing age is ${p.ageShort}.`,
+      };
+    case 'Yield':
+    case 'Yield Aggregator':
+    case 'Farm':
+      return {
+        entry: (p) =>
+          `Open a ${p.sizePhrase} in ${p.name} on ${p.chain}: deposit a major stablecoin into a documented vault and keep the share token. ${p.ageSentence}`,
+        core: (p) =>
+          `Route the deposit into ${p.name}'s documented core strategy on ${p.chain}, stake the receipt only if its documentation names a staking contract, and stay inside the ${p.sizeRange} band.`,
+        upkeep: (p) =>
+          `Claim and compound any published yield from ${p.name}'s own app on ${p.chain} once a week, and check the vault's fees and caps. Its listing age is ${p.ageShort}.`,
+      };
+    case 'Options Vault':
+      return {
+        entry: (p) =>
+          `Open a ${p.sizePhrase} in ${p.name} on ${p.chain}: deposit into a documented vault and note its expiry before entering. ${p.ageSentence}`,
+        core: (p) =>
+          `Choose the ${p.name} vault on ${p.chain} whose expiry and settlement terms you can explain, and keep the ${p.sizeRange} band small enough to hold to expiry.`,
+        upkeep: (p) =>
+          `Note ${p.name}'s vault expiry on ${p.chain}, decide before expiry whether to roll or withdraw, and keep enough ${p.gasShort} for the exit. Its listing age is ${p.ageShort}.`,
+      };
+    case 'Risk Curators':
+      return {
+        entry: (p) =>
+          `Allocate a ${p.sizePhrase} to a vault curated by ${p.name} on ${p.chain} and keep the vault shares. ${p.ageSentence}`,
+        core: (p) =>
+          `Read ${p.name}'s documented allocation and risk notes for ${p.chain}, split the position across more than one documented vault, and keep the total inside the ${p.sizeRange} band.`,
+        upkeep: (p) =>
+          `Recheck ${p.name}'s curated positions on ${p.chain} once a week and withdraw from any vault whose collateral or counterparty changes. Its listing age is ${p.ageShort}.`,
+      };
+    case 'Onchain Capital Allocator':
+      return {
+        entry: (p) =>
+          `Deposit a ${p.sizePhrase} into a documented ${p.name} vault on ${p.chain} and keep the receipt token. ${p.ageSentence}`,
+        core: (p) =>
+          `Review how ${p.name} splits capital across ${p.chain} venues, keep the deposit through one full allocation cycle, and stay inside the ${p.sizeRange} band.`,
+        upkeep: (p) =>
+          `Check ${p.name}'s documented allocation and risk on ${p.chain} once a week and rebalance only through the official app. Its listing age is ${p.ageShort}.`,
+      };
+    case 'RWA':
+      return {
+        entry: (p) =>
+          `Complete onboarding and put a ${p.sizePhrase} into ${p.name}'s documented RWA product on ${p.chain}. ${p.ageSentence}`,
+        core: (p) =>
+          `Hold ${p.name}'s receipt on ${p.chain}, test the redemption path, and reinvest distributions only through the protocol's official platform while keeping the ${p.sizeRange} band.`,
+        upkeep: (p) =>
+          `Check ${p.name}'s NAV, distribution and redemption window on ${p.chain} once a week and keep records of every mint and redemption. Its listing age is ${p.ageShort}.`,
+      };
     case 'Derivatives':
-      return [
-        {
-          text: `Deposit $${capital} of USDC as margin on ${name} on ${chain} and keep the account isolated from other funds.`,
-          cost: `$${capital} of capital plus ${gas}`,
-          time: '20 minutes',
-        },
-        {
-          text: `Open one small hedge or options position worth no more than 20% of the margin and note its expiry.`,
-          cost: `${gas} for the opening trade`,
-          time: '15 minutes',
-        },
-        {
-          text: `Close or roll the position once a week, keep the margin ratio comfortable, and claim rewards from the official app.`,
-          cost: `${gas} per weekly trade`,
-          time: '10 minutes a week',
-        },
-        {
-          text: `Follow ${name}'s official documentation, blog and governance forum for listings, fee changes and token news.`,
-          cost: 'no on-chain cost',
-          time: '10 minutes a week',
-        },
-      ];
+    case 'Interest Rate Derivatives':
+    case 'Prediction Market':
+    case 'OTC Marketplace':
+      return {
+        entry: (p) =>
+          `Open a ${p.sizePhrase} in ${p.name} on ${p.chain}: deposit margin or collateral in an account kept apart from other funds. ${p.ageSentence}`,
+        core: (p) =>
+          `Open one hedge, options or prediction position on ${p.name} in ${p.chain} worth no more than 20% of the margin, note its expiry or resolution date, and keep the ${p.sizeRange} band as the ceiling.`,
+        upkeep: (p) =>
+          `Close or roll the ${p.name} position on ${p.chain} once a week, keep the margin ratio comfortable, and keep enough ${p.gasShort} for the trade. Its listing age is ${p.ageShort}.`,
+      };
+    case 'Basis Trading':
+      return {
+        entry: (p) =>
+          `Open a ${p.sizePhrase} in ${p.name} on ${p.chain}: deposit collateral first and keep the spot and futures legs in the same account. ${p.ageSentence}`,
+        core: (p) =>
+          `Open offsetting spot and futures legs of similar size on ${p.name} in ${p.chain}, keep the basis and funding terms visible, and stay inside the ${p.sizeRange} band.`,
+        upkeep: (p) =>
+          `Monitor ${p.name}'s basis and funding on ${p.chain} once a week, roll the legs before expiry, and keep the ${p.sizeRange} band as the ceiling. Its listing age is ${p.ageShort}.`,
+      };
     case 'Launchpad':
-      return [
-        {
-          text: `Fund a fresh wallet with $${capital} on ${chain} and connect it only to ${name}'s official launch page.`,
-          cost: `$${capital} of capital plus ${gas}`,
-          time: '15 minutes',
-        },
-        {
-          text: `Complete ${name}'s allowlist, quest or staking requirements and mint or buy one small launch allocation.`,
-          cost: `${gas} for the qualification transactions`,
-          time: '30 minutes',
-        },
-        {
-          text: `Return each week for new launches, keep the wallet active, and never share its seed phrase with a launch page.`,
-          cost: `${gas} per weekly transaction`,
-          time: '10 minutes a week',
-        },
-        {
-          text: `Follow ${name}'s official blog, documentation and governance forum for sale dates and token announcements.`,
-          cost: 'no on-chain cost',
-          time: '10 minutes a week',
-        },
-      ];
+      return {
+        entry: (p) =>
+          `Fund a fresh wallet on ${p.chain} with a ${p.sizePhrase} and connect it only to ${p.name}'s official launch page. ${p.ageSentence}`,
+        core: (p) =>
+          `Complete ${p.name}'s allowlist, quest or staking requirements on ${p.chain} and take one small allocation instead of a full-size entry, staying inside the ${p.sizeRange} band.`,
+        upkeep: (p) =>
+          `Return to ${p.name} on ${p.chain} each week for new launches, keep the wallet active, and never share its seed phrase. Its listing age is ${p.ageShort}.`,
+      };
+    case 'Chain':
+      return {
+        entry: (p) =>
+          `Bridge a ${p.sizePhrase} onto ${p.chain} and keep the receiving wallet separate from your main holdings. ${p.ageSentence}`,
+        core: (p) =>
+          `Use one documented native application on ${p.chain} within ${p.name}'s ecosystem, such as a DEX, lending market or bridge, and keep the ${p.sizeRange} band as the ceiling.`,
+        upkeep: (p) =>
+          `Keep a small gas balance on ${p.chain} and make one documented transaction through ${p.name}'s ecosystem each week. Its listing age is ${p.ageShort}.`,
+      };
+    case 'Staking Pool':
+    case 'Restaking':
+      return {
+        entry: (p) =>
+          `Acquire the native asset or documented liquid staking token on ${p.chain}, starting with a ${p.sizePhrase}, and keep the receipt. ${p.ageSentence}`,
+        core: (p) =>
+          `Stake or delegate through ${p.name}'s official app on ${p.chain}, keep the receipt or delegation record, and stay inside the ${p.sizeRange} band.`,
+        upkeep: (p) =>
+          `Check ${p.name}'s validator, slashing and reward status on ${p.chain} once a week and keep enough ${p.gasShort} for a withdrawal. Its listing age is ${p.ageShort}.`,
+      };
+    case 'Stablecoin Wrapper':
+    case 'Dual-Token Stablecoin':
+      return {
+        entry: (p) =>
+          `Mint ${p.name}'s wrapper on ${p.chain} with a ${p.sizePhrase} of a major stablecoin and keep the receipt. ${p.ageSentence}`,
+        core: (p) =>
+          `Hold ${p.name}'s receipt on ${p.chain}, test a small redemption, and keep the mint and redeem paths separate inside the ${p.sizeRange} band.`,
+        upkeep: (p) =>
+          `Check ${p.name}'s collateral, peg and redemption status on ${p.chain} once a week and keep the position inside the ${p.sizeRange} band. Its listing age is ${p.ageShort}.`,
+      };
+    case 'CeDeFi':
+      return {
+        entry: (p) =>
+          `Open a ${p.sizePhrase} in ${p.name} on ${p.chain} through its official app and confirm the custody and withdrawal path first. ${p.ageSentence}`,
+        core: (p) =>
+          `Complete one deposit and one small withdrawal on ${p.name} in ${p.chain} before increasing size, keeping the total inside the ${p.sizeRange} band.`,
+        upkeep: (p) =>
+          `Reconcile ${p.name}'s balances on ${p.chain} once a week and keep a small withdrawal test ready. Its listing age is ${p.ageShort}.`,
+      };
+    case 'Cross Chain Bridge':
+      return {
+        entry: (p) =>
+          `Bridge a ${p.sizePhrase} through ${p.name} from ${p.chain} to one documented destination chain and keep the transfer receipt. ${p.ageSentence}`,
+        core: (p) =>
+          `Use one documented application on the destination chain after the ${p.name} transfer and keep the bridge receipt until finality, staying inside the ${p.sizeRange} band.`,
+        upkeep: (p) =>
+          `Track the ${p.name} transfer from ${p.chain} until finality and keep enough ${p.gasShort} for the destination transaction. Its listing age is ${p.ageShort}.`,
+      };
+    case 'Payments':
+    case 'Crypto Card Issuer':
+      return {
+        entry: (p) =>
+          `Set up ${p.name} on ${p.chain} and load a ${p.sizePhrase} for one small payment test. ${p.ageSentence}`,
+        core: (p) =>
+          `Make one small payment or card transaction through ${p.name} on ${p.chain} and keep the receipt inside the ${p.sizeRange} band.`,
+        upkeep: (p) =>
+          `Reconcile ${p.name}'s payments on ${p.chain} once a week and keep the balance below the amount you would miss. Its listing age is ${p.ageShort}.`,
+      };
+    case 'Insurance':
+      return {
+        entry: (p) =>
+          `Buy cover through ${p.name} on ${p.chain} for a ${p.sizePhrase} of existing exposure and keep the policy terms. ${p.ageSentence}`,
+        core: (p) =>
+          `Check ${p.name}'s coverage terms, exclusions and expiry on ${p.chain} before relying on the policy, and keep the premium inside the ${p.sizeRange} band.`,
+        upkeep: (p) =>
+          `Check ${p.name}'s coverage expiry and claim window on ${p.chain} once a week and renew only if the terms still match the position. Its listing age is ${p.ageShort}.`,
+      };
+    case 'Privacy':
+      return {
+        entry: (p) =>
+          `Move a ${p.sizePhrase} through ${p.name} on ${p.chain} with its official app and keep a withdrawal test in reserve. ${p.ageSentence}`,
+        core: (p) =>
+          `Test one deposit and one withdrawal through ${p.name} on ${p.chain} with a small amount before moving the rest, keeping the ${p.sizeRange} band.`,
+        upkeep: (p) =>
+          `Recheck ${p.name}'s withdrawal path on ${p.chain} once a week and keep the position small enough to exit in one transaction. Its listing age is ${p.ageShort}.`,
+      };
+    case 'Governance Incentives':
+      return {
+        entry: (p) =>
+          `Acquire the governance asset through ${p.name}'s official process on ${p.chain} with a ${p.sizePhrase} and keep the delegation record. ${p.ageSentence}`,
+        core: (p) =>
+          `Delegate or lock through ${p.name}'s official governance page on ${p.chain}, record the lock terms, and keep the total inside the ${p.sizeRange} band.`,
+        upkeep: (p) =>
+          `Review ${p.name}'s proposals on ${p.chain} once a week and keep the delegated or locked position within the terms you recorded. Its listing age is ${p.ageShort}.`,
+      };
     default:
-      return [
-        {
-          text: `Deposit $${capital} of USDC into ${name} on ${chain} and keep the receipt or position visible in the protocol's own app.`,
-          cost: `$${capital} of capital plus ${gas}`,
-          time: '15 minutes',
-        },
-        {
-          text: `Use ${name}'s core product once as its documentation describes, such as a swap, a stake, a mint or a deposit.`,
-          cost: `${gas} for the transaction`,
-          time: '20 minutes',
-        },
-        {
-          text: `Return to ${name} once a week for one qualifying action and keep the position open across several snapshots.`,
-          cost: `${gas} per weekly action`,
-          time: '10 minutes a week',
-        },
-        {
-          text: `Follow ${name}'s official blog, documentation and governance forum for product changes and token announcements.`,
-          cost: 'no on-chain cost',
-          time: '10 minutes a week',
-        },
-      ];
+      return {
+        entry: (p) =>
+          `Open a ${p.sizePhrase} in ${p.name} on ${p.chain} and read its documentation before the first transaction. ${p.ageSentence}`,
+        core: (p) =>
+          `Use ${p.name}'s core product on ${p.chain} once as its documentation describes, such as a swap, a stake, a mint or a deposit, and keep the ${p.sizeRange} band as the ceiling.`,
+        upkeep: (p) =>
+          `Return to ${p.name} on ${p.chain} once a week for one documented action and keep the ${p.sizeRange} position open across several snapshots. Its listing age is ${p.ageShort}.`,
+      };
   }
 }
 
-/** A protocol's five-step plan: four category actions and the shared risk and exit step. */
-function farmSteps(p: SnapshotProtocol, chain: string): string[] {
-  const capital = capitalFor(p.tvl_usd);
-  const gas = gasFor(chain);
-  const actions = [...categoryActions(p.category, p.name, chain, capital, gas), riskStep(p.name, p.category, gas)];
+/** Every step states the TVL band; a category text may omit it, so the plan adds it once. */
+function withBand(text: string, p: FarmProfile): string {
+  return text.includes(p.sizeRange) ? text : `${text} Keep the total inside the ${p.sizeRange} band.`;
+}
+
+/** Every step states the listing age; the core and momentum steps get it added when absent. */
+function withAge(text: string, p: FarmProfile): string {
+  return text.includes(p.ageShort) ? text : `${text} The listing is ${p.ageShort}.`;
+}
+
+/** A protocol's five-step plan: three category actions, a momentum check and a risk step. */
+function farmSteps(p: SnapshotProtocol, ageDays: number | null): string[] {
+  const profile = profileFor(p, ageDays);
+  const play = categoryPlay(profile.category);
+  const actions: FarmAction[] = [
+    {
+      text: withBand(play.entry(profile), profile),
+      cost: `${profile.sizeRange} of capital plus ${profile.gas}`,
+      time: '20 minutes',
+    },
+    {
+      text: withAge(withBand(play.core(profile), profile), profile),
+      cost: profile.gas,
+      time: '20 minutes',
+    },
+    {
+      text: withBand(play.upkeep(profile), profile),
+      cost: `${profile.gas} once a week`,
+      time: '10 minutes a week',
+    },
+    {
+      text: withAge(withBand(momentumAndIntel(profile), profile), profile),
+      cost: 'no on-chain cost',
+      time: '10 minutes a week',
+    },
+    riskStep(profile),
+  ];
   return actions.map(stepText);
 }
 
 /** The ranked board: every selected protocol, by implied value, with ranks 1..n. */
-function buildBoard(snapshot: Snapshot, table: MultipleTable): RadarRow[] {
+function buildBoard(snapshot: Snapshot, table: MultipleTable, selected: SnapshotProtocol[]): RadarRow[] {
   const watch = new Set(snapshot.watchlist);
-  const scored = selectProtocols(snapshot).map((p) => ({ p, ...scoreProtocol(p, snapshot.as_of, table) }));
+  const scored = selected.map((p) => ({ p, ...scoreProtocol(p, snapshot.as_of, table) }));
   scored.sort((a, b) => {
     if (b.implied !== a.implied) return b.implied - a.implied;
     if (b.p.tvl_usd !== a.p.tvl_usd) return b.p.tvl_usd - a.p.tvl_usd;
@@ -640,13 +901,12 @@ function buildBoard(snapshot: Snapshot, table: MultipleTable): RadarRow[] {
     return 0;
   });
   return scored.map((s, index) => {
-    const chain = primaryChain(s.p);
     return {
       slug: s.p.slug,
       name: s.p.name,
       rank: index + 1,
       implied_value_usd: s.implied,
-      farm_steps: farmSteps(s.p, chain),
+      farm_steps: farmSteps(s.p, s.age),
       category: s.p.category,
       chains: s.p.chains,
       tvl_usd: s.p.tvl_usd,
@@ -662,7 +922,9 @@ function buildBoard(snapshot: Snapshot, table: MultipleTable): RadarRow[] {
 /** The board and the page's dataset from one snapshot. */
 export function buildRadar(snapshot: Snapshot): { board: RadarRow[]; radar: RadarData } {
   const table = buildMultipleTable(snapshot.protocols);
-  const board = buildBoard(snapshot, table);
+  const selection = selectProtocols(snapshot);
+  const board = buildBoard(snapshot, table, selection.selected);
+  const funnel = buildFunnel(snapshot, board.length, selection.excluded);
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
@@ -670,7 +932,9 @@ export function buildRadar(snapshot: Snapshot): { board: RadarRow[]; radar: Rada
     model_version: MODEL_VERSION,
     model: {
       multiples: table.by_category,
+      multiples_detail: table.detail,
       global_multiple: table.global,
+      global_samples: table.global_samples,
       min_category_samples: MIN_GROUP_SAMPLES,
       multiple_min: MULTIPLE_MIN,
       multiple_max: MULTIPLE_MAX,
@@ -680,6 +944,9 @@ export function buildRadar(snapshot: Snapshot): { board: RadarRow[]; radar: Rada
       age_full_days: AGE_FULL_DAYS,
       implied_floor_usd: 1,
     },
+    exclusion_rules: EXCLUSION_RULES.map((rule) => ({ ...rule, snapshot_fields: [...rule.snapshot_fields] })),
+    excluded: selection.excluded,
+    funnel,
     rows: board,
     stats: {
       protocols: snapshot.protocols.length,
@@ -718,13 +985,20 @@ export function boardIssue(board: RadarRow[], snapshot: Snapshot): string | null
   if (missing.length > 0) {
     return `the board misses ${missing.length} watchlist slug${missing.length === 1 ? '' : 's'}: ${missing.slice(0, 5).join(', ')}`;
   }
+  const stepSets = new Set<string>();
   for (const row of board) {
     if (row.farm_steps.length < 3 || row.farm_steps.length > 12) {
       return `${row.slug} has ${row.farm_steps.length} farm steps`;
     }
+    const stepSet = JSON.stringify(row.farm_steps);
+    if (stepSets.has(stepSet)) return `${row.slug} repeats another row's farm steps`;
+    stepSets.add(stepSet);
     for (const step of row.farm_steps) {
       const length = step.trim().length;
       if (length < 20 || length > 600) return `${row.slug} has a farm step of ${length} characters`;
+      if (!step.includes(row.name) && !row.chains.some((chain) => step.includes(chain))) {
+        return `${row.slug} has a farm step that names neither the protocol nor a chain`;
+      }
     }
   }
   return null;
