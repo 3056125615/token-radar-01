@@ -148,6 +148,98 @@
     $('ledger-btn').textContent = 'Show the ' + fmtNum(excluded.length) + '-row ledger';
   }
 
+  // The board at a glance: every ranked row on log axes, drawn inline.
+  var glancePlot = $('glance-plot');
+  var glanceLegend = $('glance-legend');
+  var glanceWidth = 0;
+  var GLANCE_H = 320;
+
+  function fmtTick(value) {
+    if (value >= 1e9) return '$' + Math.round(value / 1e9) + 'B';
+    if (value >= 1e6) return '$' + Math.round(value / 1e6) + 'M';
+    return '$' + Math.round(value / 1e3) + 'K';
+  }
+
+  function renderGlance() {
+    if (listView.hidden) return;
+    var width = Math.round(glancePlot.clientWidth);
+    if (width < 220 || width === glanceWidth) return;
+    glanceWidth = width;
+    var L = 52, R = 14, T = 16, B = 30;
+    var iw = width - L - R;
+    var ih = GLANCE_H - T - B;
+    var xLo = Infinity, xHi = -Infinity, yLo = Infinity, yHi = -Infinity;
+    rows.forEach(function (row) {
+      var x = Math.log10(row.tvl_usd);
+      var y = Math.log10(row.implied_value_usd);
+      if (x < xLo) xLo = x;
+      if (x > xHi) xHi = x;
+      if (y < yLo) yLo = y;
+      if (y > yHi) yHi = y;
+    });
+    xLo -= 0.06; xHi += 0.06; yLo -= 0.06; yHi += 0.06;
+    function px(value) { return L + (value - xLo) / (xHi - xLo) * iw; }
+    function py(value) { return T + ih - (value - yLo) / (yHi - yLo) * ih; }
+
+    var svg = '<svg class="glance-svg" viewBox="0 0 ' + width + ' ' + GLANCE_H + '" role="img" ' +
+      'aria-label="All ' + rows.length + ' ranked protocols: TVL versus implied value on log scales, with the global median multiple as a dashed line.">';
+    var p;
+    for (p = Math.ceil(xLo); p <= Math.floor(xHi); p += 1) {
+      var gx = px(p);
+      svg += '<line class="tick" x1="' + gx.toFixed(1) + '" y1="' + T + '" x2="' + gx.toFixed(1) + '" y2="' + (T + ih) + '"/>' +
+        '<text x="' + gx.toFixed(1) + '" y="' + (T + ih + 16) + '" text-anchor="middle">' + fmtTick(Math.pow(10, p)) + '</text>';
+    }
+    for (p = Math.ceil(yLo); p <= Math.floor(yHi); p += 1) {
+      var gy = py(p);
+      svg += '<line class="tick" x1="' + L + '" y1="' + gy.toFixed(1) + '" x2="' + (L + iw) + '" y2="' + gy.toFixed(1) + '"/>' +
+        '<text x="' + (L - 8) + '" y="' + (gy + 3.5).toFixed(1) + '" text-anchor="end">' + fmtTick(Math.pow(10, p)) + '</text>';
+    }
+    svg += '<line x1="' + L + '" y1="' + T + '" x2="' + L + '" y2="' + (T + ih) + '" stroke="#1b2939"/>' +
+      '<line x1="' + L + '" y1="' + (T + ih) + '" x2="' + (L + iw) + '" y2="' + (T + ih) + '" stroke="#1b2939"/>' +
+      '<text class="axis-title" x="' + L + '" y="10">implied value ↑</text>' +
+      '<text class="axis-title" x="' + (L + iw) + '" y="' + (GLANCE_H - 4) + '" text-anchor="end">TVL →</text>';
+
+    // The reference line: implied = TVL × global multiple, clipped to the plot.
+    var glog = Math.log10(model.global_multiple);
+    var ax = xLo, ay = ax + glog;
+    if (ay < yLo) { ay = yLo; ax = ay - glog; }
+    if (ay > yHi) { ay = yHi; ax = ay - glog; }
+    var bx = xHi, by = bx + glog;
+    if (by > yHi) { by = yHi; bx = by - glog; }
+    if (by < yLo) { by = yLo; bx = by - glog; }
+    svg += '<line x1="' + px(ax).toFixed(1) + '" y1="' + py(ay).toFixed(1) + '" x2="' + px(bx).toFixed(1) +
+      '" y2="' + py(by).toFixed(1) + '" stroke="#f2b64c" stroke-opacity=".5" stroke-dasharray="5 4" stroke-width="1.2"/>';
+    var lxData = xLo + (xHi - xLo) * 0.68;
+    var lx = px(lxData);
+    var ly = py(lxData + glog) - 7;
+    if (ly < T + 10) ly = py(lxData + glog) + 15;
+    svg += '<text class="line-label" x="' + lx.toFixed(1) + '" y="' + ly.toFixed(1) + '" text-anchor="middle">' +
+      'global median multiple ×' + model.global_multiple.toFixed(3) + '</text>';
+
+    // Watchlist points last so they sit above the rest.
+    rows.slice().sort(function (a, b) {
+      return (a.watchlist ? 1 : 0) - (b.watchlist ? 1 : 0);
+    }).forEach(function (row) {
+      svg += '<circle data-slug="' + esc(row.slug) + '" cx="' + px(Math.log10(row.tvl_usd)).toFixed(1) +
+        '" cy="' + py(Math.log10(row.implied_value_usd)).toFixed(1) + '" r="3.1" fill="' +
+        (row.watchlist ? '#f2b64c' : '#5b7590') + '"' + (row.watchlist ? '' : ' fill-opacity=".8"') + '>' +
+        '<title>' + esc(row.name) + ' · TVL ' + fmtUsd(row.tvl_usd) + ' · implied ' + fmtUsd(row.implied_value_usd) + '</title></circle>';
+    });
+    svg += '</svg>';
+    glancePlot.innerHTML = svg;
+
+    var watchCount = 0;
+    rows.forEach(function (row) { if (row.watchlist) watchCount += 1; });
+    glanceLegend.innerHTML = '<span class="lg"><i class="w"></i>Watchlist (' + watchCount + ')</span>' +
+      '<span class="lg"><i></i>Other ranked (' + (rows.length - watchCount) + ')</span>';
+  }
+
+  glancePlot.addEventListener('click', function (event) {
+    var dot = event.target.closest ? event.target.closest('circle[data-slug]') : null;
+    if (dot) openSlug(dot.getAttribute('data-slug'));
+  });
+  window.addEventListener('resize', function () { requestAnimationFrame(renderGlance); });
+
   var ledgerBuilt = false;
   function buildLedger() {
     var body = excluded.map(function (row) {
@@ -412,6 +504,45 @@
     };
   }
 
+  function median(values) {
+    var list = values.slice().sort(function (a, b) { return a - b; });
+    var mid = list.length >> 1;
+    return list.length % 2 ? list[mid] : (list[mid - 1] + list[mid]) / 2;
+  }
+
+  function ordinal(value) {
+    var rem = value % 100;
+    if (rem >= 11 && rem <= 13) return value + 'th';
+    return value + ({ 1: 'st', 2: 'nd', 3: 'rd' }[value % 10] || 'th');
+  }
+
+  // Standing is derived from RADAR.rows, not read off the row itself.
+  function standingHtml(row) {
+    var n = rows.length;
+    var rank = 1;
+    var tvlRank = 1;
+    var atOrBelow = 0;
+    rows.forEach(function (other) {
+      if (other.implied_value_usd > row.implied_value_usd) rank += 1;
+      if (other.tvl_usd > row.tvl_usd) tvlRank += 1;
+      if (other.implied_value_usd <= row.implied_value_usd) atOrBelow += 1;
+    });
+    var pct = Math.max(1, Math.round(atOrBelow / n * 100));
+    var boardMedian = median(rows.map(function (other) { return other.multiple; }));
+    function delta(value, base) {
+      var change = (value / base - 1) * 100;
+      return (change > 0 ? '+' : '') + change.toFixed(0) + '%';
+    }
+    return '<section class="box standing">' +
+      '<h3>Standing on this board</h3>' +
+      '<p>Rank <b>#' + rank + '</b> of ' + n + ' by implied value · <b>' + ordinal(pct) +
+        ' percentile</b> · TVL ranks <b>#' + tvlRank + '</b> of ' + n + '</p>' +
+      '<p>Multiple <b>×' + row.multiple.toFixed(3) + '</b> vs board median <b>×' + boardMedian.toFixed(3) +
+        '</b> (' + delta(row.multiple, boardMedian) + ') · vs global median <b>×' +
+        model.global_multiple.toFixed(3) + '</b> (' + delta(row.multiple, model.global_multiple) + ')</p>' +
+      '</section>';
+  }
+
   function detailHtml(row) {
     var calc = compute(row);
     var ok = calc.implied === row.implied_value_usd;
@@ -463,6 +594,7 @@
         '<div class="fact"><span>House watchlist</span><b>' + (row.watchlist ? 'Yes' : 'No') + '</b></div>' +
         '<div class="fact wide"><span>Chains (' + row.chains.length + ')</span><b>' + esc(chainList) + '</b></div>' +
       '</div>' +
+      standingHtml(row) +
       '<section class="box">' +
         '<h3>Recompute from the model</h3>' +
         '<p class="lede">The same arithmetic as lib/model.ts, run here from this row and RADAR.model.</p>' +
@@ -512,6 +644,7 @@
     detailView.hidden = true;
     listView.hidden = false;
     document.title = 'Token Launch Radar';
+    renderGlance();
     if (returning && savedScroll) {
       requestAnimationFrame(function () { window.scrollTo(0, savedScroll); });
     }
@@ -535,6 +668,9 @@
   }
 
   window.addEventListener('hashchange', route);
+  $('glance-n').textContent = fmtNum(rows.length);
   render();
+  renderGlance();
   route();
+  requestAnimationFrame(renderGlance);
 })();

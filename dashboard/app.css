@@ -91,6 +91,24 @@ main.wrap{padding-top:22px;padding-bottom:8px}
 .mini tbody tr:hover td{background:rgba(255,255,255,.02)}
 .disc{margin:14px 0 0;padding-top:12px;border-top:1px solid var(--line-soft);font-size:11.5px;color:var(--muted)}
 
+/* At a glance */
+.glance{margin:0 0 18px;padding:18px 22px 12px}
+.glance-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px 24px;flex-wrap:wrap}
+.glance .sec{margin-bottom:6px}
+.glance-lede{margin:0 0 10px;max-width:940px;font-size:12px;line-height:1.6;color:var(--muted)}
+.glance-lede b{color:var(--fg);font-weight:600;font-variant-numeric:tabular-nums}
+.glance-legend{display:flex;flex-wrap:wrap;gap:6px 16px;padding-top:2px;font-size:10.5px;color:var(--dim)}
+.glance-legend .lg{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+.glance-legend i{width:7px;height:7px;border-radius:50%;background:#5b7590;opacity:.85}
+.glance-legend i.w{background:var(--accent);opacity:1}
+.glance-plot,.glance-svg{display:block;width:100%;height:320px}
+.glance-svg text{fill:var(--dim);font-family:var(--mono);font-size:10px;font-variant-numeric:tabular-nums}
+.glance-svg .tick{stroke:var(--line-soft);stroke-width:1}
+.glance-svg .axis-title{font-size:9.5px;letter-spacing:.04em}
+.glance-svg .line-label{fill:#d3ad67;font-size:10.5px;paint-order:stroke;stroke:#0d1521;stroke-width:3px;stroke-linejoin:round}
+.glance-svg circle[data-slug]{cursor:pointer}
+.glance-svg circle[data-slug]:hover{stroke:#fff;stroke-width:1.2}
+
 /* Coverage & exclusions */
 .cover{margin-top:18px;padding:20px 24px 22px}
 .cover-lede{margin:0;max-width:980px;font-size:12.5px;line-height:1.6;color:var(--muted)}
@@ -200,6 +218,11 @@ main.wrap{padding-top:22px;padding-bottom:8px}
 .match.ok{color:var(--up)}
 .match.bad{color:var(--down)}
 .fine{margin:8px 0 0;font-size:10.5px;color:var(--dim)}
+.standing{padding:14px 18px 15px;background:#0b1320}
+.standing h3{margin-bottom:5px}
+.standing p{margin:0;font-size:12px;line-height:1.75;color:var(--muted)}
+.standing p+p{margin-top:1px}
+.standing b{color:var(--fg);font-weight:600;font-variant-numeric:tabular-nums}
 .steps{margin:10px 0 0;padding-left:22px}
 .steps li{padding:10px 0 10px 2px;border-bottom:1px solid var(--line-soft);font-size:13px;line-height:1.65;color:var(--fg-2)}
 .steps li:last-child{padding-bottom:4px;border-bottom:0}
@@ -223,6 +246,7 @@ footer{margin-top:44px;border-top:1px solid var(--line)}
   .fstage{flex:1 1 40%}
   .farrow{display:none}
   .method-copy,.method-side{padding:18px}
+  .glance{padding:16px 14px 8px}
   .cover{padding:16px}
   .cov{font-size:11.5px}
   .cov code{font-size:9.5px;white-space:normal}

@@ -149,8 +149,6 @@ const MIN_GROUP_SAMPLES = 3;
 const GROWTH_CLAMP_PCT = 30;
 const GROWTH_WEIGHT = 0.5;
 const AGE_WEIGHT = 0.2;
-/** A seven-day move below this absolute percentage is not called out as momentum. */
-const MOMENTUM_THRESHOLD_PCT = 10;
 /** At 360 days, 1 + age/30 = 13 and the age term reaches its full weight. */
 const AGE_FULL_DAYS = 360;
 const AGE_LOG_TARGET = Math.log10(1 + AGE_FULL_DAYS / 30);
@@ -535,13 +533,6 @@ function ageFor(ageDays: number | null): { clause: string; short: string } {
   };
 }
 
-/** The change as a momentum clause only when it is at least 10% in either direction. */
-function momentumFor(change: number | null): string | null {
-  if (change === null || Math.abs(change) < MOMENTUM_THRESHOLD_PCT) return null;
-  const direction = change > 0 ? 'up' : 'down';
-  return `TVL is ${direction} ${Math.abs(change).toFixed(1)}% over seven days`;
-}
-
 /** Gas in the chain's own tier, with a short form for sentences. */
 function gasProfile(chain: string): { cost: string; short: string } {
   const key = chain.toLowerCase();
@@ -557,24 +548,80 @@ function gasProfile(chain: string): { cost: string; short: string } {
   return { cost: 'moderate gas at about $0.50-2 per transaction', short: 'moderate gas' };
 }
 
+/** The seven plan families every fine category maps into, so each draws on three skeletons. */
+type PlanFamily = 'dex' | 'lending' | 'yield' | 'trading' | 'rwa' | 'chain' | 'payments';
+
+function planFamily(category: string): PlanFamily {
+  switch (category) {
+    case 'Dexs':
+    case 'Liquidity Manager':
+      return 'dex';
+    case 'Lending':
+    case 'Uncollateralized Lending':
+    case 'Leveraged Farming':
+    case 'CDP':
+    case 'CDP Manager':
+    case 'Collateral Markets':
+    case 'Anchor BTC':
+    case 'Decentralized BTC':
+      return 'lending';
+    case 'Yield':
+    case 'Yield Aggregator':
+    case 'Farm':
+    case 'Options Vault':
+    case 'Risk Curators':
+    case 'Onchain Capital Allocator':
+      return 'yield';
+    case 'Derivatives':
+    case 'Interest Rate Derivatives':
+    case 'Prediction Market':
+    case 'OTC Marketplace':
+    case 'Basis Trading':
+      return 'trading';
+    case 'RWA':
+      return 'rwa';
+    case 'Chain':
+    case 'Cross Chain Bridge':
+    case 'Restaking':
+    case 'Staking Pool':
+      return 'chain';
+    default:
+      return 'payments';
+  }
+}
+
 /** All the protocol-specific material one plan may use, taken from the snapshot fields alone. */
 interface FarmProfile {
   name: string;
   chain: string;
+  chains: string[];
   category: string;
+  family: PlanFamily;
   sizeTier: SizeTier;
   sizeLabel: string;
   sizeRange: string;
   sizePhrase: string;
   ageShort: string;
+  ageClause: string;
   ageSentence: string;
-  momentum: string | null;
   change7d: number | null;
+  changeText: string;
+  tvlText: string;
+  impliedText: string;
+  multipleText: string;
   gas: string;
   gasShort: string;
+  ageDays: number | null;
 }
 
-function profileFor(p: SnapshotProtocol, ageDays: number | null): FarmProfile {
+/** A whole-dollar figure in the compact form a step can read: $5.0M, $715.9M, $2.76B. */
+function usdCompact(value: number): string {
+  if (value >= 1_000_000_000) return `$${(value / 1_000_000_000).toFixed(2)}B`;
+  if (value >= 1_000_000) return `$${(value / 1_000_000).toFixed(1)}M`;
+  return `$${Math.round(value / 1_000)}K`;
+}
+
+function profileFor(p: SnapshotProtocol, ageDays: number | null, implied: number, multiple: number): FarmProfile {
   const size = sizeFor(p.tvl_usd);
   const age = ageFor(ageDays);
   const chain = primaryChain(p);
@@ -582,21 +629,34 @@ function profileFor(p: SnapshotProtocol, ageDays: number | null): FarmProfile {
   return {
     name: p.name,
     chain,
+    chains: [...p.chains],
     category: p.category ?? 'Uncategorized',
+    family: planFamily(p.category ?? 'Uncategorized'),
     sizeTier: size.tier,
     sizeLabel: size.label,
     sizeRange: size.range,
     sizePhrase: `${size.label} (${size.range})`,
     ageShort: age.short,
+    ageClause: age.clause,
     ageSentence:
       ageDays === null
         ? `${p.name}'s listing date is not recorded in this snapshot.`
         : `${p.name} has been listed for ${age.clause}.`,
-    momentum: momentumFor(p.change_7d),
     change7d: p.change_7d,
+    changeText: p.change_7d === null ? 'not recorded in this snapshot' : `${p.change_7d >= 0 ? '+' : ''}${p.change_7d.toFixed(1)}%`,
+    tvlText: usdCompact(p.tvl_usd),
+    impliedText: usdCompact(implied),
+    multipleText: `${multiple.toFixed(2)}x`,
     gas: gas.cost,
     gasShort: gas.short,
+    ageDays,
   };
+}
+
+/** The seven-day move as a clause, including the snapshot's own silence when it records none. */
+function changePhrase(p: FarmProfile): string {
+  if (p.change7d === null) return 'a seven-day move this snapshot does not record';
+  return `a seven-day move of ${p.changeText}`;
 }
 
 /** The shared last step: every plan ends with a risk and exit rule that names the protocol and chain. */
@@ -608,24 +668,217 @@ function riskStep(p: FarmProfile): FarmAction {
   };
 }
 
-/** The tier's own add-on advice, so even the momentum step reads differently by TVL band. */
-function tierAdvice(p: FarmProfile): string {
-  if (p.sizeTier === 'small') return 'Keep it a test position and do not average down';
-  if (p.sizeTier === 'mid') return 'Stage any add-on in two clips';
-  return 'Size any add-on in thirds';
+/** Documentation and the tokenless record, before any capital moves. */
+function reconAction(p: FarmProfile): FarmAction {
+  const ageText =
+    p.ageDays === null
+      ? `this snapshot does not record ${p.name}'s listing age`
+      : `this snapshot records ${p.ageClause}`;
+  return {
+    text: `Read ${p.name}'s documentation and verify its official contract on ${p.chain}; ${ageText}.`,
+    cost: 'no on-chain cost',
+    time: '20 minutes',
+  };
 }
 
-/** The seven-day move, stated either as a momentum signal or as the measured absence of one. */
-function momentumNote(p: FarmProfile): string {
-  if (p.momentum !== null) return p.momentum;
-  if (p.change7d === null) return 'its seven-day change is not recorded in this snapshot';
-  const magnitude = Math.abs(p.change7d).toFixed(2);
-  return `the absolute seven-day move is ${magnitude}%, below the ${MOMENTUM_THRESHOLD_PCT}% momentum mark`;
+/** The qualification gate a family asks for before a first deposit. */
+function qualifyAction(p: FarmProfile): FarmAction {
+  const data = `this snapshot records ${p.tvlText} TVL and ${changePhrase(p)}`;
+  let text: string;
+  switch (p.family) {
+    case 'dex':
+      text = `Before funding, check ${p.name}'s official token list and regional terms on ${p.chain}; ${data}.`;
+      break;
+    case 'lending':
+      text = `Before funding, check ${p.name}'s published collateral list, loan-to-value caps and liquidation terms on ${p.chain}; ${data}.`;
+      break;
+    case 'yield':
+      text = `Before funding, check ${p.name}'s vault whitelist, deposit caps and fee schedule on ${p.chain}; ${data}.`;
+      break;
+    case 'trading':
+      text = `Before funding, check ${p.name}'s margin eligibility, jurisdiction rules and settlement terms on ${p.chain}; ${data}.`;
+      break;
+    case 'rwa':
+      text = `Before funding, complete ${p.name}'s onboarding and eligibility checks on ${p.chain}; ${data}.`;
+      break;
+    case 'chain':
+      text = `Before funding, check ${p.name}'s supported assets, withdrawal terms and finality on ${p.chain}; ${data}.`;
+      break;
+    default:
+      text = `Before funding, complete ${p.name}'s account setup and eligibility checks on ${p.chain}; ${data}.`;
+      break;
+  }
+  return { text, cost: 'no on-chain cost', time: '20-40 minutes' };
 }
 
-/** The fourth step: momentum, the TVL band, and the protocol's own information channels. */
-function momentumAndIntel(p: FarmProfile): string {
-  return `Momentum and intel check on ${p.name} on ${p.chain}: ${momentumNote(p)}. ${tierAdvice(p)}, keep the total inside the ${p.sizeRange} band, and follow ${p.name}'s official blog, documentation and governance forum for fee changes, incentives and token announcements.`;
+/** A small first interaction sized to prove the deposit and exit path, not to earn. */
+function testAction(p: FarmProfile): FarmAction {
+  let test: string;
+  switch (p.family) {
+    case 'dex':
+      test = 'one small swap, then add a minimal two-sided position and withdraw it the same day so the deposit and exit path are proven';
+      break;
+    case 'lending':
+      test = 'supply a major stablecoin, borrow a small amount, repay it and withdraw, so the collateral and health-factor path is proven';
+      break;
+    case 'yield':
+      test = 'deposit into a documented vault, confirm the share token arrives, and withdraw the same day where the vault allows it';
+      break;
+    case 'trading':
+      test = 'open one small position, close it, and withdraw the remaining margin so the settlement path is proven';
+      break;
+    case 'rwa':
+      test = 'subscribe or mint the smallest documented amount after onboarding, then test the redemption path before sizing up';
+      break;
+    case 'chain':
+      test = 'bridge or stake a small amount, make one native transaction, and unwind it so the exit path is proven';
+      break;
+    default:
+      test = 'complete one mint, payment, cover or deposit, then exercise the withdrawal or redemption path before sizing up';
+      break;
+  }
+  return {
+    text: `Run a $100-300 test on ${p.name} on ${p.chain}: ${test}. This snapshot records ${p.tvlText} TVL and ${changePhrase(p)}.`,
+    cost: `about $100-300 of capital plus ${p.gas}`,
+    time: '15 minutes',
+  };
+}
+
+/** Funding plus the chain scope: two real chains for a multi-chain protocol, one chain otherwise. */
+function fundAction(p: FarmProfile): FarmAction {
+  if (p.chains.length >= 2) {
+    const first = p.chains[0]!;
+    const second = p.chains[1]!;
+    return {
+      text: `Fund and rotate between ${first} and ${second}: move the first ${p.sizeRange} from ${first} to ${second} through a bridge you have already used, keep a working balance on both chains, and rotate back only after the ${p.name} position on each side is confirmed.`,
+      cost: `${p.sizeRange} of capital plus bridge and ${p.gas}`,
+      time: '20 minutes',
+    };
+  }
+  if (p.chains.length === 1) {
+    return {
+      text: `Fund only on ${p.chains[0]}: the snapshot records ${p.name} on that chain alone, so keep all capital there and do not bridge the position to another chain.`,
+      cost: `${p.sizeRange} of capital plus ${p.gas}`,
+      time: '15 minutes',
+    };
+  }
+  return {
+    text: `Fund only on the chain ${p.name} documents as its main deployment: this snapshot records no chain for ${p.name}, so confirm the deployment before moving any capital.`,
+    cost: `${p.sizeRange} of capital plus ${p.gas}`,
+    time: '20 minutes',
+  };
+}
+
+/** The sizing rule that turns the snapshot's implied value and category multiple into a cap. */
+function sizeAction(p: FarmProfile): FarmAction {
+  return {
+    text: `Size the whole plan from ${p.name}'s ${p.impliedText} implied value and ${p.multipleText} category multiple: cap the position at ${p.sizeRange}, and treat that band as the hard ceiling on ${p.chain}.`,
+    cost: 'no on-chain cost',
+    time: '10 minutes',
+  };
+}
+
+/** The family's own core action, with the sizing derivation when the plan has no separate size step. */
+function coreAction(p: FarmProfile, play: CategoryPlay, withSizing: boolean, withAge: boolean): FarmAction {
+  let base = play.entry(p);
+  if (!withAge && base.endsWith(p.ageSentence)) base = base.slice(0, -p.ageSentence.length).trimEnd();
+  base = withBand(base, p);
+  const text = withSizing
+    ? `${base} Its band follows from the ${p.impliedText} implied value at the ${p.multipleText} category multiple.`
+    : base;
+  return { text, cost: `${p.sizeRange} of capital plus ${p.gas}`, time: '20 minutes' };
+}
+
+/** The tokenless record as a review horizon, for the skeleton that keeps it as its own step. */
+function ageAction(p: FarmProfile): FarmAction {
+  const ageText =
+    p.ageDays === null
+      ? `This snapshot does not record ${p.name}'s listing date`
+      : `${p.name} has been listed for ${p.ageClause}`;
+  return {
+    text: `${ageText}; on ${p.chain}, treat that record as the review horizon and compare it with the ${p.tvlText} TVL before adding capital.`,
+    cost: 'no on-chain cost',
+    time: '10 minutes',
+  };
+}
+
+/** The momentum and multiple check, for the skeleton that keeps it as its own step. */
+function momentumAction(p: FarmProfile): FarmAction {
+  const move = p.change7d === null ? 'not recorded in this snapshot' : p.changeText;
+  return {
+    text: `Recheck ${p.name} on ${p.chain}: its seven-day move is ${move}, its TVL is ${p.tvlText}, and the plan should continue only while the ${p.multipleText} category multiple still supports the ${p.impliedText} implied value.`,
+    cost: 'no on-chain cost',
+    time: '10 minutes a week',
+  };
+}
+
+/** The family's own weekly upkeep, with the size band enforced once more. */
+function maintainAction(p: FarmProfile, play: CategoryPlay): FarmAction {
+  return {
+    text: withBand(play.upkeep(p), p),
+    cost: `${p.gas} once a week`,
+    time: '10 minutes a week',
+  };
+}
+
+/** The action kinds the skeletons order; their text comes from the profile, family and category. */
+type StepKind = 'recon' | 'qualify' | 'fund' | 'test' | 'size' | 'core' | 'age' | 'momentum' | 'maintain' | 'risk';
+
+/**
+ * Three skeletons, each with a 4, 5, 6 and 7 step form: a test-first plan, a qualification-first
+ * plan and a funding-first plan. Every form ends in the risk step; the long forms add reading,
+ * momentum, age or upkeep in different positions, so the sequences differ in kinds, not only words.
+ */
+const PLAN_SKELETONS: Record<number, StepKind[]>[] = [
+  {
+    4: ['test', 'fund', 'core', 'risk'],
+    5: ['test', 'fund', 'size', 'core', 'risk'],
+    6: ['recon', 'test', 'fund', 'size', 'core', 'risk'],
+    7: ['recon', 'test', 'fund', 'size', 'core', 'momentum', 'risk'],
+  },
+  {
+    4: ['qualify', 'fund', 'core', 'risk'],
+    5: ['qualify', 'fund', 'size', 'core', 'risk'],
+    6: ['qualify', 'recon', 'fund', 'size', 'core', 'risk'],
+    7: ['qualify', 'recon', 'fund', 'size', 'core', 'age', 'risk'],
+  },
+  {
+    4: ['fund', 'test', 'core', 'risk'],
+    5: ['fund', 'test', 'size', 'core', 'risk'],
+    6: ['fund', 'recon', 'test', 'size', 'core', 'risk'],
+    7: ['fund', 'recon', 'test', 'size', 'core', 'maintain', 'risk'],
+  },
+];
+
+function actionFor(
+  kind: StepKind,
+  p: FarmProfile,
+  play: CategoryPlay,
+  hasSize: boolean,
+  withAge: boolean,
+): FarmAction {
+  switch (kind) {
+    case 'recon':
+      return reconAction(p);
+    case 'qualify':
+      return qualifyAction(p);
+    case 'fund':
+      return fundAction(p);
+    case 'test':
+      return testAction(p);
+    case 'size':
+      return sizeAction(p);
+    case 'core':
+      return coreAction(p, play, !hasSize, withAge);
+    case 'age':
+      return ageAction(p);
+    case 'momentum':
+      return momentumAction(p);
+    case 'maintain':
+      return maintainAction(p, play);
+    case 'risk':
+      return riskStep(p);
+  }
 }
 
 /** Three category-common actions; every one names the protocol, its chain and its TVL band. */
@@ -854,39 +1107,107 @@ function withBand(text: string, p: FarmProfile): string {
   return text.includes(p.sizeRange) ? text : `${text} Keep the total inside the ${p.sizeRange} band.`;
 }
 
-/** Every step states the listing age; the core and momentum steps get it added when absent. */
-function withAge(text: string, p: FarmProfile): string {
-  return text.includes(p.ageShort) ? text : `${text} The listing is ${p.ageShort}.`;
+/** One row's stable plan draw: which skeleton, and how many steps its detail tier allows. */
+interface PlanSeed {
+  skeleton: number;
+  stepCount: number;
 }
 
-/** A protocol's five-step plan: three category actions, a momentum check and a risk step. */
-function farmSteps(p: SnapshotProtocol, ageDays: number | null): string[] {
-  const profile = profileFor(p, ageDays);
+interface PlanSeedRow {
+  slug: string;
+  category: string;
+  family: PlanFamily;
+  watchlist: boolean;
+  topTvl: boolean;
+}
+
+/** FNV-1a over the slug: the stable draw behind a row's skeleton and step count. */
+function slugHash(slug: string): number {
+  let hash = 2166136261;
+  for (let i = 0; i < slug.length; i += 1) {
+    hash ^= slug.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+/** Move the highest-hash row of the largest bucket until every skeleton is used in the group. */
+function coverSkeletons(group: PlanSeedRow[], skeleton: Map<string, number>, hash: Map<string, number>): void {
+  const counts = [0, 0, 0];
+  for (const row of group) {
+    const bucket = skeleton.get(row.slug)!;
+    counts[bucket] = counts[bucket]! + 1;
+  }
+  for (let missing = 0; missing < 3; missing += 1) {
+    if (counts[missing]! > 0) continue;
+    let donor = -1;
+    for (let bucket = 0; bucket < 3; bucket += 1) {
+      if (counts[bucket]! < 2) continue;
+      if (donor < 0 || counts[bucket]! > counts[donor]!) donor = bucket;
+    }
+    if (donor < 0) return;
+    const candidates = group
+      .filter((row) => skeleton.get(row.slug) === donor)
+      .sort((a, b) => hash.get(b.slug)! - hash.get(a.slug)!);
+    const moved = candidates[0];
+    if (moved === undefined) return;
+    skeleton.set(moved.slug, missing);
+    counts[donor] = counts[donor]! - 1;
+    counts[missing] = counts[missing]! + 1;
+  }
+}
+
+/**
+ * The plan draw for every row: hash the slug into one of three skeletons, then let each fine
+ * category with three or more rows and each plan family fill any missing skeleton by moving the
+ * highest-hash row of its largest bucket. The high-detail rows (watchlist or top-50 TVL) draw six
+ * or seven steps from the same hash; every other row draws four or five.
+ */
+function planSeeds(rows: PlanSeedRow[]): Map<string, PlanSeed> {
+  const hash = new Map<string, number>();
+  const skeleton = new Map<string, number>();
+  for (const row of rows) {
+    const h = slugHash(row.slug);
+    hash.set(row.slug, h);
+    skeleton.set(row.slug, h % 3);
+  }
+  const byCategory = new Map<string, PlanSeedRow[]>();
+  const byFamily = new Map<PlanFamily, PlanSeedRow[]>();
+  for (const row of rows) {
+    const categoryGroup = byCategory.get(row.category);
+    if (categoryGroup === undefined) byCategory.set(row.category, [row]);
+    else categoryGroup.push(row);
+    const familyGroup = byFamily.get(row.family);
+    if (familyGroup === undefined) byFamily.set(row.family, [row]);
+    else familyGroup.push(row);
+  }
+  for (const group of byCategory.values()) {
+    if (group.length >= 3) coverSkeletons(group, skeleton, hash);
+  }
+  for (const group of byFamily.values()) coverSkeletons(group, skeleton, hash);
+  const seeds = new Map<string, PlanSeed>();
+  for (const row of rows) {
+    const h = hash.get(row.slug)!;
+    const stepCount = row.watchlist || row.topTvl ? 6 + (h & 1) : 4 + ((h >>> 1) & 1);
+    seeds.set(row.slug, { skeleton: skeleton.get(row.slug)!, stepCount });
+  }
+  return seeds;
+}
+
+/** A protocol's plan in its drawn skeleton, every step ending with its cost and duration. */
+function farmSteps(
+  p: SnapshotProtocol,
+  ageDays: number | null,
+  implied: number,
+  multiple: number,
+  seed: PlanSeed,
+): string[] {
+  const profile = profileFor(p, ageDays, implied, multiple);
   const play = categoryPlay(profile.category);
-  const actions: FarmAction[] = [
-    {
-      text: withBand(play.entry(profile), profile),
-      cost: `${profile.sizeRange} of capital plus ${profile.gas}`,
-      time: '20 minutes',
-    },
-    {
-      text: withAge(withBand(play.core(profile), profile), profile),
-      cost: profile.gas,
-      time: '20 minutes',
-    },
-    {
-      text: withBand(play.upkeep(profile), profile),
-      cost: `${profile.gas} once a week`,
-      time: '10 minutes a week',
-    },
-    {
-      text: withAge(withBand(momentumAndIntel(profile), profile), profile),
-      cost: 'no on-chain cost',
-      time: '10 minutes a week',
-    },
-    riskStep(profile),
-  ];
-  return actions.map(stepText);
+  const kinds = PLAN_SKELETONS[seed.skeleton]![seed.stepCount]!;
+  const hasSize = kinds.includes('size');
+  const keepAge = !kinds.includes('recon') && !kinds.includes('age');
+  return kinds.map((kind) => stepText(actionFor(kind, profile, play, hasSize, keepAge)));
 }
 
 /** The ranked board: every selected protocol, by implied value, with ranks 1..n. */
@@ -900,13 +1221,33 @@ function buildBoard(snapshot: Snapshot, table: MultipleTable, selected: Snapshot
     if (a.p.slug > b.p.slug) return 1;
     return 0;
   });
+  const topTvl = new Set(
+    [...scored]
+      .sort((a, b) => {
+        if (b.p.tvl_usd !== a.p.tvl_usd) return b.p.tvl_usd - a.p.tvl_usd;
+        if (a.p.slug < b.p.slug) return -1;
+        if (a.p.slug > b.p.slug) return 1;
+        return 0;
+      })
+      .slice(0, 50)
+      .map((s) => s.p.slug),
+  );
+  const seeds = planSeeds(
+    scored.map((s) => ({
+      slug: s.p.slug,
+      category: s.p.category ?? 'Uncategorized',
+      family: planFamily(s.p.category ?? 'Uncategorized'),
+      watchlist: watch.has(s.p.slug),
+      topTvl: topTvl.has(s.p.slug),
+    })),
+  );
   return scored.map((s, index) => {
     return {
       slug: s.p.slug,
       name: s.p.name,
       rank: index + 1,
       implied_value_usd: s.implied,
-      farm_steps: farmSteps(s.p, s.age),
+      farm_steps: farmSteps(s.p, s.age, s.implied, s.multiple, seeds.get(s.p.slug)!),
       category: s.p.category,
       chains: s.p.chains,
       tvl_usd: s.p.tvl_usd,
